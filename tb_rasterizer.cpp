@@ -104,13 +104,13 @@ int main(int argc, char **argv) {
     dut->rst = 0;
 
     // Draw same triangles as C++ reference
-    draw_triangle_hw(dut, {10, 10}, {200, 30}, {100, 200}, 0xFF0000);
-    draw_triangle_hw(dut, {150, 50}, {310, 80}, {230, 230}, 0x00FF00);
-    draw_triangle_hw(dut, {50, 120}, {160, 100}, {80, 230}, 0x0000FF);
+    draw_triangle_hw(dut, {10, 10}, {200, 30}, {100, 180}, 0xFF0000);
+    draw_triangle_hw(dut, {150, 50}, {310, 80}, {230, 190}, 0x00FF00);
+    draw_triangle_hw(dut, {50, 100}, {160, 80}, {80, 190}, 0x0000FF);
 
-    draw_triangle_ref({10, 10}, {200, 30}, {100, 200}, 0xFF0000);
-    draw_triangle_ref({150, 50}, {310, 80}, {230, 230}, 0x00FF00);
-    draw_triangle_ref({50, 120}, {160, 100}, {80, 230}, 0x0000FF);
+    draw_triangle_ref({10, 10}, {200, 30}, {100, 180}, 0xFF0000);
+    draw_triangle_ref({150, 50}, {310, 80}, {230, 190}, 0x00FF00);
+    draw_triangle_ref({50, 100}, {160, 80}, {80, 190}, 0x0000FF);
 
     // Read back framebuffer and convert RGB565 to RGB888
     for (int y = 0; y < H; y++) {

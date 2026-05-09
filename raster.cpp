@@ -84,9 +84,9 @@ int main() {
             fb[y][x] = 0;
 
     // Draw a couple of flat-shaded triangles
-    draw_triangle({10, 10}, {200, 30}, {100, 200}, 0xFF0000); // red
-    draw_triangle({150, 50}, {310, 80}, {230, 230}, 0x00FF00); // green
-    draw_triangle({50, 120}, {160, 100}, {80, 200}, 0x0000FF); // blue
+    draw_triangle({10, 10}, {200, 30}, {100, 180}, 0xFF0000); // red
+    draw_triangle({150, 50}, {310, 80}, {230, 190}, 0x00FF00); // green
+    draw_triangle({50, 100}, {160, 80}, {80, 190}, 0x0000FF); // blue
 
     // Write PPM
     FILE *f = fopen("out.ppm", "wb");
