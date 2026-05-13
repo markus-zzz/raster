@@ -7,9 +7,8 @@ module raster_top #(
     input  logic rst,
     // Triangle input
     input  logic start,
-    input  logic [9:0] v0_x, v0_y,
-    input  logic [9:0] v1_x, v1_y,
-    input  logic [9:0] v2_x, v2_y,
+    input  logic [$clog2(WIDTH)-1:0] v0_x, v1_x, v2_x,
+    input  logic [$clog2(HEIGHT)-1:0] v0_y, v1_y, v2_y,
     input  logic [23:0] color,
     output logic done,
     // Framebuffer read port (pixel addressing)
@@ -25,7 +24,8 @@ module raster_top #(
     logic [15:0]            fb_rd_data_bank[4];
 
     rasterizer #(
-        .WIDTH(WIDTH),
+        .RWIDTH(WIDTH),
+        .RHEIGHT(HEIGHT),
         .ADDR_WIDTH(ADDR_WIDTH)
     ) rast (
         .clk(clk),

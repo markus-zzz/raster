@@ -1,14 +1,18 @@
 module rasterizer #(
-    parameter WIDTH = 320,
-    parameter ADDR_WIDTH = 16
+    parameter RWIDTH = 320,
+    parameter RHEIGHT = 200,
+    parameter ADDR_WIDTH = $clog2((RWIDTH/2) * (RHEIGHT/2))
 ) (
     input  logic clk,
     input  logic rst,
     // Triangle input
     input  logic start,
-    input  logic [9:0] v0_x, v0_y,
-    input  logic [9:0] v1_x, v1_y,
-    input  logic [9:0] v2_x, v2_y,
+    input  logic [$clog2(RWIDTH)-1:0] v0_x,
+    input  logic [$clog2(RHEIGHT)-1:0] v0_y,
+    input  logic [$clog2(RWIDTH)-1:0] v1_x,
+    input  logic [$clog2(RHEIGHT)-1:0] v1_y,
+    input  logic [$clog2(RWIDTH)-1:0] v2_x,
+    input  logic [$clog2(RHEIGHT)-1:0] v2_y,
     input  logic [23:0] color,
     output logic done,
     // Framebuffer write (one 64-bit quad per cycle)
@@ -17,6 +21,10 @@ module rasterizer #(
     output logic [63:0]           fb_data,
     output logic [3:0]            fb_mask  // byte enable for each pixel
 );
+
+    localparam CW = $clog2(RWIDTH);   // coordinate width for x
+    localparam CH = $clog2(RHEIGHT);   // coordinate width for y
+    localparam EW = CW + CH + 1;      // edge function width: product of two (CW+1)-bit * (CH+1)-bit signed values
 
     typedef enum logic [3:0] {
         IDLE,
@@ -29,41 +37,54 @@ module rasterizer #(
     state_t state;
 
     // Bounding box
-    logic [9:0] minx, miny, maxx, maxy;
-    logic [9:0] qx, qy;
+    logic [CW-1:0] minx, maxx;
+    logic [CH-1:0] miny, maxy;
+    logic [CW-1:0] qx;
+    logic [CH-1:0] qy;
 
     // Edge function values
-    logic signed [20:0] e0_row, e1_row, e2_row;
-    logic signed [20:0] e0_col, e1_col, e2_col;
-    logic signed [20:0] e0_dx, e1_dx, e2_dx;
-    logic signed [20:0] e0_dy, e1_dy, e2_dy;
+    logic signed [EW-1:0] e0_row, e1_row, e2_row;
+    logic signed [EW-1:0] e0_col, e1_col, e2_col;
+    logic signed [EW-1:0] e0_dx, e1_dx, e2_dx;
+    logic signed [EW-1:0] e0_dy, e1_dy, e2_dy;
 
     // Quad pixel values
-    logic signed [20:0] p0_e0, p0_e1, p0_e2;
-    logic signed [20:0] p1_e0, p1_e1, p1_e2;
-    logic signed [20:0] p2_e0, p2_e1, p2_e2;
-    logic signed [20:0] p3_e0, p3_e1, p3_e2;
+    logic signed [EW-1:0] p0_e0, p0_e1, p0_e2;
+    logic signed [EW-1:0] p1_e0, p1_e1, p1_e2;
+    logic signed [EW-1:0] p2_e0, p2_e1, p2_e2;
+    logic signed [EW-1:0] p3_e0, p3_e1, p3_e2;
 
     // Convert 24-bit RGB to 16-bit RGB565
     logic [15:0] color_565;
     assign color_565 = {color[23:19], color[15:10], color[7:3]};
 
-    function automatic logic signed [20:0] edge_func(
-        input logic [9:0] v0x, v0y, v1x, v1y, px, py
+    function automatic logic signed [EW-1:0] edge_func(
+        input logic [CW-1:0] v0x, input logic [CH-1:0] v0y,
+        input logic [CW-1:0] v1x, input logic [CH-1:0] v1y,
+        input logic [CW-1:0] px,  input logic [CH-1:0] py
     );
-        logic signed [10:0] dx, dy, dpx, dpy;
-        dx = $signed({1'b0, v1x}) - $signed({1'b0, v0x});
-        dy = $signed({1'b0, v1y}) - $signed({1'b0, v0y});
-        dpx = $signed({1'b0, px}) - $signed({1'b0, v0x});
-        dpy = $signed({1'b0, py}) - $signed({1'b0, v0y});
-        return dx * dpy - dy * dpx;
+        logic signed [CW:0] dx, dpx;
+        logic signed [CH:0] dy, dpy;
+        dx  = $signed({1'b0, v1x}) - $signed({1'b0, v0x});
+        dy  = $signed({1'b0, v1y}) - $signed({1'b0, v0y});
+        dpx = $signed({1'b0, px})  - $signed({1'b0, v0x});
+        dpy = $signed({1'b0, py})  - $signed({1'b0, v0y});
+        return EW'(dx * dpy) - EW'(dy * dpx);
     endfunction
 
-    function automatic logic [9:0] min3(input logic [9:0] a, b, c);
+    function automatic logic [CW-1:0] min3x(input logic [CW-1:0] a, b, c);
         return (a < b) ? ((a < c) ? a : c) : ((b < c) ? b : c);
     endfunction
 
-    function automatic logic [9:0] max3(input logic [9:0] a, b, c);
+    function automatic logic [CW-1:0] max3x(input logic [CW-1:0] a, b, c);
+        return (a > b) ? ((a > c) ? a : c) : ((b > c) ? b : c);
+    endfunction
+
+    function automatic logic [CH-1:0] min3y(input logic [CH-1:0] a, b, c);
+        return (a < b) ? ((a < c) ? a : c) : ((b < c) ? b : c);
+    endfunction
+
+    function automatic logic [CH-1:0] max3y(input logic [CH-1:0] a, b, c);
         return (a > b) ? ((a > c) ? a : c) : ((b > c) ? b : c);
     endfunction
 
@@ -81,28 +102,29 @@ module rasterizer #(
                     done <= 0;
                     if (start) begin
                         // Compute bounding box aligned to 2x2 grid
-                        logic [9:0] tmp_minx, tmp_miny, tmp_maxx, tmp_maxy;
-                        tmp_minx = min3(v0_x, v1_x, v2_x);
-                        tmp_miny = min3(v0_y, v1_y, v2_y);
-                        tmp_maxx = max3(v0_x, v1_x, v2_x);
-                        tmp_maxy = max3(v0_y, v1_y, v2_y);
+                        logic [CW-1:0] tmp_minx, tmp_maxx;
+                        logic [CH-1:0] tmp_miny, tmp_maxy;
+                        tmp_minx = min3x(v0_x, v1_x, v2_x);
+                        tmp_miny = min3y(v0_y, v1_y, v2_y);
+                        tmp_maxx = max3x(v0_x, v1_x, v2_x);
+                        tmp_maxy = max3y(v0_y, v1_y, v2_y);
                         
-                        minx <= {tmp_minx[9:1], 1'b0};
-                        miny <= {tmp_miny[9:1], 1'b0};
-                        maxx <= (tmp_maxx >= WIDTH) ? (WIDTH - 1) : tmp_maxx;
-                        maxy <= (tmp_maxy >= 10'd200) ? 10'd199 : tmp_maxy;
+                        minx <= {tmp_minx[CW-1:1], 1'b0};
+                        miny <= {tmp_miny[CH-1:1], 1'b0};
+                        maxx <= (tmp_maxx >= CW'(RWIDTH))  ? CW'(RWIDTH - 1)  : tmp_maxx;
+                        maxy <= (tmp_maxy >= CH'(RHEIGHT)) ? CH'(RHEIGHT - 1) : tmp_maxy;
                         state <= SETUP;
                     end
                 end
 
                 SETUP: begin
-                    // Compute edge deltas (signed 11-bit differences)
-                    e0_dx <= -21'($signed({1'b0, v1_y}) - $signed({1'b0, v0_y}));
-                    e0_dy <=  21'($signed({1'b0, v1_x}) - $signed({1'b0, v0_x}));
-                    e1_dx <= -21'($signed({1'b0, v2_y}) - $signed({1'b0, v1_y}));
-                    e1_dy <=  21'($signed({1'b0, v2_x}) - $signed({1'b0, v1_x}));
-                    e2_dx <= -21'($signed({1'b0, v0_y}) - $signed({1'b0, v2_y}));
-                    e2_dy <=  21'($signed({1'b0, v0_x}) - $signed({1'b0, v2_x}));
+                    // Compute edge deltas
+                    e0_dx <= -EW'($signed({1'b0, v1_y}) - $signed({1'b0, v0_y}));
+                    e0_dy <=  EW'($signed({1'b0, v1_x}) - $signed({1'b0, v0_x}));
+                    e1_dx <= -EW'($signed({1'b0, v2_y}) - $signed({1'b0, v1_y}));
+                    e1_dy <=  EW'($signed({1'b0, v2_x}) - $signed({1'b0, v1_x}));
+                    e2_dx <= -EW'($signed({1'b0, v0_y}) - $signed({1'b0, v2_y}));
+                    e2_dy <=  EW'($signed({1'b0, v0_x}) - $signed({1'b0, v2_x}));
 
                     // Initial edge values at origin (minx, miny)
                     e0_row <= edge_func(v0_x, v0_y, v1_x, v1_y, minx, miny);
@@ -153,7 +175,7 @@ module rasterizer #(
                     logic [ADDR_WIDTH-1:0] quad_addr;
                     logic [3:0] mask;
                     
-                    quad_addr = ADDR_WIDTH'(qy >> 1) * ADDR_WIDTH'(WIDTH >> 1) + ADDR_WIDTH'(qx >> 1);
+                    quad_addr = ADDR_WIDTH'(qy >> 1) * ADDR_WIDTH'(RWIDTH >> 1) + ADDR_WIDTH'(qx >> 1);
                     
                     // Generate mask for valid pixels
                     mask = {
