@@ -1,18 +1,19 @@
 module raster_top #(
     parameter WIDTH = 320,
     parameter HEIGHT = 200,
+    parameter SUBPIXEL = 4,
     parameter ADDR_WIDTH = $clog2((WIDTH/2) * (HEIGHT/2))
 ) (
     input  logic clk,
     input  logic rst,
-    // Triangle input
+    // Triangle input (sub-pixel fixed-point)
     input  logic start,
-    input  logic [$clog2(WIDTH)-1:0] v0_x, v1_x, v2_x,
-    input  logic [$clog2(HEIGHT)-1:0] v0_y, v1_y, v2_y,
+    input  logic [$clog2(WIDTH)+SUBPIXEL-1:0] v0_x, v1_x, v2_x,
+    input  logic [$clog2(HEIGHT)+SUBPIXEL-1:0] v0_y, v1_y, v2_y,
     input  logic [15:0] v0_iz, v1_iz, v2_iz,
     input  logic [23:0] color,
     output logic done,
-    // Framebuffer read port (pixel addressing)
+    // Framebuffer read port
     input  logic [ADDR_WIDTH+1:0] fb_rd_pixel_addr,
     output logic [15:0] fb_rd_data
 );
@@ -32,6 +33,7 @@ module raster_top #(
     rasterizer #(
         .RWIDTH(WIDTH),
         .RHEIGHT(HEIGHT),
+        .SUBPIXEL(SUBPIXEL),
         .ADDR_WIDTH(ADDR_WIDTH)
     ) rast (
         .clk(clk),
@@ -90,7 +92,6 @@ module raster_top #(
         end
     endgenerate
 
-    // Mux out the correct pixel from the quad
     assign fb_rd_data = fb_rd_data_bank[fb_rd_pixel_addr[1:0]];
 
 endmodule

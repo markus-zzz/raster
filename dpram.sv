@@ -13,7 +13,7 @@ module dpram #(
     output logic [DATA_WIDTH-1:0]   rd_data
 );
     
-    (* ram_style = "block" *) logic [DATA_WIDTH-1:0] mem [0:DEPTH-1];
+    (* ram_style = "block" *) logic [DATA_WIDTH-1:0] mem [0:DEPTH-1] /* verilator public */;
     
     always_ff @(posedge clk) begin
         if (wr_en)

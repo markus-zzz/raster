@@ -1,18 +1,19 @@
 module rasterizer #(
     parameter RWIDTH = 320,
     parameter RHEIGHT = 200,
+    parameter SUBPIXEL = 4,
     parameter ADDR_WIDTH = $clog2((RWIDTH/2) * (RHEIGHT/2))
 ) (
     input  logic clk,
     input  logic rst,
-    // Triangle input
+    // Triangle input (fixed-point: SUBPIXEL fractional bits)
     input  logic start,
-    input  logic [$clog2(RWIDTH)-1:0] v0_x,
-    input  logic [$clog2(RHEIGHT)-1:0] v0_y,
-    input  logic [$clog2(RWIDTH)-1:0] v1_x,
-    input  logic [$clog2(RHEIGHT)-1:0] v1_y,
-    input  logic [$clog2(RWIDTH)-1:0] v2_x,
-    input  logic [$clog2(RHEIGHT)-1:0] v2_y,
+    input  logic [$clog2(RWIDTH)+SUBPIXEL-1:0] v0_x,
+    input  logic [$clog2(RHEIGHT)+SUBPIXEL-1:0] v0_y,
+    input  logic [$clog2(RWIDTH)+SUBPIXEL-1:0] v1_x,
+    input  logic [$clog2(RHEIGHT)+SUBPIXEL-1:0] v1_y,
+    input  logic [$clog2(RWIDTH)+SUBPIXEL-1:0] v2_x,
+    input  logic [$clog2(RHEIGHT)+SUBPIXEL-1:0] v2_y,
     input  logic [15:0] v0_iz, v1_iz, v2_iz,
     input  logic [23:0] color,
     output logic done,
@@ -28,9 +29,11 @@ module rasterizer #(
     output logic [3:0]            zb_wr_mask
 );
 
-    localparam CW = $clog2(RWIDTH);
+    localparam CW = $clog2(RWIDTH);   // pixel coordinate width
     localparam CH = $clog2(RHEIGHT);
-    localparam EW = CW + CH + 1;
+    localparam VW = CW + SUBPIXEL;    // vertex coordinate width (with sub-pixel)
+    localparam VH = CH + SUBPIXEL;
+    localparam EW = VW + VH + 1;      // edge function width
     localparam IZ_FRAC = 16 + EW;
 
     typedef enum logic [2:0] {
@@ -42,36 +45,37 @@ module rasterizer #(
 
     state_t state;
 
-    // Bounding box
+    // Bounding box (pixel coordinates)
     logic [CW-1:0] minx, maxx;
     logic [CH-1:0] miny, maxy;
     logic [CW-1:0] qx;
     logic [CH-1:0] qy;
 
-    // Edge function values
+    // Edge function values (sub-pixel precision)
     logic signed [EW-1:0] e0_row, e1_row, e2_row;
     logic signed [EW-1:0] e0_col, e1_col, e2_col;
-    logic signed [EW-1:0] e0_dx, e1_dx, e2_dx;
-    logic signed [EW-1:0] e0_dy, e1_dy, e2_dy;
+    logic signed [EW-1:0] e0_dx, e1_dx, e2_dx;  // per-pixel step in x
+    logic signed [EW-1:0] e0_dy, e1_dy, e2_dy;  // per-pixel step in y
 
     // 1/z interpolation
     logic signed [IZ_FRAC-1:0] iz_row, iz_col;
     logic signed [IZ_FRAC-1:0] iz_dx, iz_dy;
 
-    // Top-left rule bias per edge
+    // Top-left rule
     logic tl0, tl1, tl2;
 
     // Convert 24-bit RGB to 16-bit RGB565
     logic [15:0] color_565;
     assign color_565 = {color[23:19], color[15:10], color[7:3]};
 
+    // Edge function at a sub-pixel point
     function automatic logic signed [EW-1:0] edge_func(
-        input logic [CW-1:0] v0x, input logic [CH-1:0] v0y,
-        input logic [CW-1:0] v1x, input logic [CH-1:0] v1y,
-        input logic [CW-1:0] px,  input logic [CH-1:0] py
+        input logic [VW-1:0] v0x, input logic [VH-1:0] v0y,
+        input logic [VW-1:0] v1x, input logic [VH-1:0] v1y,
+        input logic [VW-1:0] px,  input logic [VH-1:0] py
     );
-        logic signed [CW:0] dx, dpx;
-        logic signed [CH:0] dy, dpy;
+        logic signed [VW:0] dx, dpx;
+        logic signed [VH:0] dy, dpy;
         dx  = $signed({1'b0, v1x}) - $signed({1'b0, v0x});
         dy  = $signed({1'b0, v1y}) - $signed({1'b0, v0y});
         dpx = $signed({1'b0, px})  - $signed({1'b0, v0x});
@@ -92,29 +96,61 @@ module rasterizer #(
         return (a > b) ? ((a > c) ? a : c) : ((b > c) ? b : c);
     endfunction
 
-    // --- Combinational setup signals (used in SETUP state) ---
+    // --- Combinational setup signals ---
+    // Edge deltas per pixel: stepping 1 pixel = stepping (1<<SUBPIXEL) in sub-pixel coords
+    // e_dx = -(v1_y - v0_y) is the edge function change per +1 sub-pixel in x
+    // Per pixel step = e_dx * (1 << SUBPIXEL), but we compute it directly as:
+    // e_dx_pixel = -(v1_y - v0_y) << SUBPIXEL... No!
+    // Actually: edge_func uses sub-pixel coords. The per-pixel-step of the edge function is:
+    // delta_x = (v1_y - v0_y) applied to a 1-pixel step = -(v1_y - v0_y) * 1_pixel
+    // But since coords are in sub-pixel units, 1 pixel = (1 << SUBPIXEL) sub-pixel units.
+    // So: e_dx_per_pixel = -(v1_y - v0_y) * (1 << SUBPIXEL)... No, that's wrong too.
+    //
+    // The edge function is: E(px,py) = (v1x-v0x)*(py-v0y) - (v1y-v0y)*(px-v0x)
+    // dE/dpx = -(v1y - v0y)  (in sub-pixel units)
+    // When we step 1 pixel in x, px changes by (1 << SUBPIXEL), so:
+    // delta_E_per_pixel_x = -(v1y - v0y) * (1 << SUBPIXEL)
+    //
+    // Similarly: delta_E_per_pixel_y = (v1x - v0x) * (1 << SUBPIXEL)
+    //
+    // But it's simpler: just compute the edge function at pixel centers.
+    // Pixel center (px, py) in sub-pixel coords = (px << SUBPIXEL) + (1 << (SUBPIXEL-1))
+    // i.e., sample at the center of the pixel.
+
     logic signed [EW-1:0] setup_e0_dx, setup_e1_dx, setup_e2_dx;
     logic signed [EW-1:0] setup_e0_dy, setup_e1_dy, setup_e2_dy;
     logic signed [EW-1:0] setup_e0_init, setup_e1_init, setup_e2_init;
     logic [CW-1:0] bbox_minx, bbox_maxx;
     logic [CH-1:0] bbox_miny, bbox_maxy;
 
+    // Pixel center in sub-pixel coords for the bounding box origin
+    logic [VW-1:0] origin_x;
+    logic [VH-1:0] origin_y;
+
     always_comb begin
-        setup_e0_dx = -EW'($signed({1'b0, v1_y}) - $signed({1'b0, v0_y}));
-        setup_e0_dy =  EW'($signed({1'b0, v1_x}) - $signed({1'b0, v0_x}));
-        setup_e1_dx = -EW'($signed({1'b0, v2_y}) - $signed({1'b0, v1_y}));
-        setup_e1_dy =  EW'($signed({1'b0, v2_x}) - $signed({1'b0, v1_x}));
-        setup_e2_dx = -EW'($signed({1'b0, v0_y}) - $signed({1'b0, v2_y}));
-        setup_e2_dy =  EW'($signed({1'b0, v0_x}) - $signed({1'b0, v2_x}));
+        // Per-pixel edge deltas (sub-pixel scale)
+        // dE/dx_pixel = -(v1y - v0y) * (1 << SUBPIXEL)
+        setup_e0_dx = -(EW'($signed({1'b0, v1_y}) - $signed({1'b0, v0_y}))) <<< SUBPIXEL;
+        setup_e0_dy =  (EW'($signed({1'b0, v1_x}) - $signed({1'b0, v0_x}))) <<< SUBPIXEL;
+        setup_e1_dx = -(EW'($signed({1'b0, v2_y}) - $signed({1'b0, v1_y}))) <<< SUBPIXEL;
+        setup_e1_dy =  (EW'($signed({1'b0, v2_x}) - $signed({1'b0, v1_x}))) <<< SUBPIXEL;
+        setup_e2_dx = -(EW'($signed({1'b0, v0_y}) - $signed({1'b0, v2_y}))) <<< SUBPIXEL;
+        setup_e2_dy =  (EW'($signed({1'b0, v0_x}) - $signed({1'b0, v2_x}))) <<< SUBPIXEL;
 
-        setup_e0_init = edge_func(v0_x, v0_y, v1_x, v1_y, minx, miny);
-        setup_e1_init = edge_func(v1_x, v1_y, v2_x, v2_y, minx, miny);
-        setup_e2_init = edge_func(v2_x, v2_y, v0_x, v0_y, minx, miny);
+        // Bounding box in pixel coords (truncate sub-pixel bits)
+        bbox_minx = min3x(v0_x[VW-1:SUBPIXEL], v1_x[VW-1:SUBPIXEL], v2_x[VW-1:SUBPIXEL]);
+        bbox_miny = min3y(v0_y[VH-1:SUBPIXEL], v1_y[VH-1:SUBPIXEL], v2_y[VH-1:SUBPIXEL]);
+        bbox_maxx = max3x(v0_x[VW-1:SUBPIXEL], v1_x[VW-1:SUBPIXEL], v2_x[VW-1:SUBPIXEL]);
+        bbox_maxy = max3y(v0_y[VH-1:SUBPIXEL], v1_y[VH-1:SUBPIXEL], v2_y[VH-1:SUBPIXEL]);
 
-        bbox_minx = min3x(v0_x, v1_x, v2_x);
-        bbox_miny = min3y(v0_y, v1_y, v2_y);
-        bbox_maxx = max3x(v0_x, v1_x, v2_x);
-        bbox_maxy = max3y(v0_y, v1_y, v2_y);
+        // Pixel center of bounding box origin in sub-pixel coords
+        origin_x = {minx, {SUBPIXEL{1'b0}}} | VW'(1 << (SUBPIXEL - 1));
+        origin_y = {miny, {SUBPIXEL{1'b0}}} | VH'(1 << (SUBPIXEL - 1));
+
+        // Edge function at the pixel center of the bounding box origin
+        setup_e0_init = edge_func(v0_x, v0_y, v1_x, v1_y, origin_x, origin_y);
+        setup_e1_init = edge_func(v1_x, v1_y, v2_x, v2_y, origin_x, origin_y);
+        setup_e2_init = edge_func(v2_x, v2_y, v0_x, v0_y, origin_x, origin_y);
     end
 
     // --- Pipeline stage 1 registers ---
@@ -169,7 +205,7 @@ module rasterizer #(
                     e1_row <= setup_e1_init;
                     e2_row <= setup_e2_init;
 
-                    // Top-left: left edge (e_dx > 0) or top edge (e_dx == 0 && e_dy < 0)
+                    // Top-left rule (based on sub-pixel edge direction)
                     tl0 <= (setup_e0_dx > 0) || (setup_e0_dx == 0 && setup_e0_dy < 0);
                     tl1 <= (setup_e1_dx > 0) || (setup_e1_dx == 0 && setup_e1_dy < 0);
                     tl2 <= (setup_e2_dx > 0) || (setup_e2_dx == 0 && setup_e2_dy < 0);
@@ -265,7 +301,6 @@ module rasterizer #(
         end else begin
             p2_valid <= p1_valid;
             if (p1_valid) begin
-                // Inside test with top-left rule: (e > 0) || (e == 0 && tl)
                 p2_inside[0] <= (p1_qy <= p1_maxy && p1_qx <= p1_maxx &&
                                  (p1_e0 > 0 || (p1_e0 == 0 && p1_tl0)) &&
                                  (p1_e1 > 0 || (p1_e1 == 0 && p1_tl1)) &&
