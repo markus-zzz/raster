@@ -58,6 +58,9 @@ module rasterizer #(
     logic signed [IZ_FRAC-1:0] iz_row, iz_col;
     logic signed [IZ_FRAC-1:0] iz_dx, iz_dy;
 
+    // Top-left rule bias per edge
+    logic tl0, tl1, tl2;
+
     // Convert 24-bit RGB to 16-bit RGB565
     logic [15:0] color_565;
     assign color_565 = {color[23:19], color[15:10], color[7:3]};
@@ -120,6 +123,7 @@ module rasterizer #(
     logic signed [EW-1:0] p1_e0_dx, p1_e1_dx, p1_e2_dx;
     logic signed [EW-1:0] p1_e0_dy, p1_e1_dy, p1_e2_dy;
     logic signed [EW-1:0] p1_e0_dxy, p1_e1_dxy, p1_e2_dxy;
+    logic p1_tl0, p1_tl1, p1_tl2;
     logic signed [IZ_FRAC-1:0] p1_iz [4];
     logic [CW-1:0] p1_qx;
     logic [CH-1:0] p1_qy;
@@ -165,8 +169,11 @@ module rasterizer #(
                     e1_row <= setup_e1_init;
                     e2_row <= setup_e2_init;
 
-                    // 1/z plane: iz = e1*v0_iz + e2*v1_iz + e0*v2_iz
-                    // Multiplies are EW × 17 bits (one DSP each)
+                    // Top-left: left edge (e_dx > 0) or top edge (e_dx == 0 && e_dy < 0)
+                    tl0 <= (setup_e0_dx > 0) || (setup_e0_dx == 0 && setup_e0_dy < 0);
+                    tl1 <= (setup_e1_dx > 0) || (setup_e1_dx == 0 && setup_e1_dy < 0);
+                    tl2 <= (setup_e2_dx > 0) || (setup_e2_dx == 0 && setup_e2_dy < 0);
+
                     iz_dx <= IZ_FRAC'(setup_e1_dx * $signed({1'b0, v0_iz}))
                            + IZ_FRAC'(setup_e2_dx * $signed({1'b0, v1_iz}))
                            + IZ_FRAC'(setup_e0_dx * $signed({1'b0, v2_iz}));
@@ -208,6 +215,10 @@ module rasterizer #(
                         p1_e0_dxy <= e0_col + e0_dx + e0_dy;
                         p1_e1_dxy <= e1_col + e1_dx + e1_dy;
                         p1_e2_dxy <= e2_col + e2_dx + e2_dy;
+
+                        p1_tl0 <= tl0;
+                        p1_tl1 <= tl1;
+                        p1_tl2 <= tl2;
 
                         p1_iz[0] <= iz_col;
                         p1_iz[1] <= iz_col + iz_dx;
@@ -254,14 +265,23 @@ module rasterizer #(
         end else begin
             p2_valid <= p1_valid;
             if (p1_valid) begin
+                // Inside test with top-left rule: (e > 0) || (e == 0 && tl)
                 p2_inside[0] <= (p1_qy <= p1_maxy && p1_qx <= p1_maxx &&
-                                 p1_e0 >= 0 && p1_e1 >= 0 && p1_e2 >= 0);
+                                 (p1_e0 > 0 || (p1_e0 == 0 && p1_tl0)) &&
+                                 (p1_e1 > 0 || (p1_e1 == 0 && p1_tl1)) &&
+                                 (p1_e2 > 0 || (p1_e2 == 0 && p1_tl2)));
                 p2_inside[1] <= (p1_qy <= p1_maxy && (p1_qx + 1) <= p1_maxx &&
-                                 p1_e0_dx >= 0 && p1_e1_dx >= 0 && p1_e2_dx >= 0);
+                                 (p1_e0_dx > 0 || (p1_e0_dx == 0 && p1_tl0)) &&
+                                 (p1_e1_dx > 0 || (p1_e1_dx == 0 && p1_tl1)) &&
+                                 (p1_e2_dx > 0 || (p1_e2_dx == 0 && p1_tl2)));
                 p2_inside[2] <= ((p1_qy + 1) <= p1_maxy && p1_qx <= p1_maxx &&
-                                 p1_e0_dy >= 0 && p1_e1_dy >= 0 && p1_e2_dy >= 0);
+                                 (p1_e0_dy > 0 || (p1_e0_dy == 0 && p1_tl0)) &&
+                                 (p1_e1_dy > 0 || (p1_e1_dy == 0 && p1_tl1)) &&
+                                 (p1_e2_dy > 0 || (p1_e2_dy == 0 && p1_tl2)));
                 p2_inside[3] <= ((p1_qy + 1) <= p1_maxy && (p1_qx + 1) <= p1_maxx &&
-                                 p1_e0_dxy >= 0 && p1_e1_dxy >= 0 && p1_e2_dxy >= 0);
+                                 (p1_e0_dxy > 0 || (p1_e0_dxy == 0 && p1_tl0)) &&
+                                 (p1_e1_dxy > 0 || (p1_e1_dxy == 0 && p1_tl1)) &&
+                                 (p1_e2_dxy > 0 || (p1_e2_dxy == 0 && p1_tl2)));
 
                 for (int i = 0; i < 4; i++)
                     p2_iz[i] <= p1_iz[i][IZ_FRAC-1 -: 16];

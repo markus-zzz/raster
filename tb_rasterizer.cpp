@@ -43,6 +43,13 @@ void draw_triangle_ref(Vec2 v0, Vec2 v1, Vec2 v2,
     EdgeStep e1 = make_edge(v1, v2, origin);
     EdgeStep e2 = make_edge(v2, v0, origin);
 
+    // Top-left rule: left edge (dx > 0) or top edge (dx == 0 && dy < 0)
+    bool tl0 = (e0.dx > 0) || (e0.dx == 0 && e0.dy < 0);
+    bool tl1 = (e1.dx > 0) || (e1.dx == 0 && e1.dy < 0);
+    bool tl2 = (e2.dx > 0) || (e2.dx == 0 && e2.dy < 0);
+
+    auto inside = [](int e, bool tl) { return e > 0 || (e == 0 && tl); };
+
     // 1/z plane: iz(p) = e1(p)*iz0 + e2(p)*iz1 + e0(p)*iz2 (unnormalized)
     // iz_dx = e1.dx*iz0 + e2.dx*iz1 + e0.dx*iz2
     // iz_dy = e1.dy*iz0 + e2.dy*iz1 + e0.dy*iz2
@@ -79,7 +86,7 @@ void draw_triangle_ref(Vec2 v0, Vec2 v1, Vec2 v2,
             iz_p[3] = iz_col + iz_dx_val + iz_dy_val;
 
             // Pixel 0 (qx, qy)
-            if (qy <= maxy && qx <= maxx && a0>=0 && a1>=0 && a2>=0) {
+            if (qy <= maxy && qx <= maxx && inside(a0,tl0) && inside(a1,tl1) && inside(a2,tl2)) {
                 uint16_t iz16 = (uint16_t)(iz_p[0] >> shift);
                 if (iz16 >= zb_ref[qy][qx]) {
                     fb_ref[qy][qx] = color;
@@ -87,7 +94,7 @@ void draw_triangle_ref(Vec2 v0, Vec2 v1, Vec2 v2,
                 }
             }
             // Pixel 1 (qx+1, qy)
-            if (qy <= maxy && qx+1 <= maxx && b0>=0 && b1>=0 && b2>=0) {
+            if (qy <= maxy && qx+1 <= maxx && inside(b0,tl0) && inside(b1,tl1) && inside(b2,tl2)) {
                 uint16_t iz16 = (uint16_t)(iz_p[1] >> shift);
                 if (iz16 >= zb_ref[qy][qx+1]) {
                     fb_ref[qy][qx+1] = color;
@@ -95,7 +102,7 @@ void draw_triangle_ref(Vec2 v0, Vec2 v1, Vec2 v2,
                 }
             }
             // Pixel 2 (qx, qy+1)
-            if (qy+1 <= maxy && qx <= maxx && c0>=0 && c1>=0 && c2>=0) {
+            if (qy+1 <= maxy && qx <= maxx && inside(c0,tl0) && inside(c1,tl1) && inside(c2,tl2)) {
                 uint16_t iz16 = (uint16_t)(iz_p[2] >> shift);
                 if (iz16 >= zb_ref[qy+1][qx]) {
                     fb_ref[qy+1][qx] = color;
@@ -103,7 +110,7 @@ void draw_triangle_ref(Vec2 v0, Vec2 v1, Vec2 v2,
                 }
             }
             // Pixel 3 (qx+1, qy+1)
-            if (qy+1 <= maxy && qx+1 <= maxx && d0>=0 && d1>=0 && d2>=0) {
+            if (qy+1 <= maxy && qx+1 <= maxx && inside(d0,tl0) && inside(d1,tl1) && inside(d2,tl2)) {
                 uint16_t iz16 = (uint16_t)(iz_p[3] >> shift);
                 if (iz16 >= zb_ref[qy+1][qx+1]) {
                     fb_ref[qy+1][qx+1] = color;
