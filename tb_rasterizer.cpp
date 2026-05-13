@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <cstring>
 
-static const int W = 320, H = 200;
+static const int W = 320, H = 240;
 static uint32_t fb_hw[H][W];
 static uint32_t fb_ref[H][W];
 

@@ -1,6 +1,6 @@
 module rasterizer #(
     parameter RWIDTH = 320,
-    parameter RHEIGHT = 200,
+    parameter RHEIGHT = 240,
     parameter ADDR_WIDTH = $clog2((RWIDTH/2) * (RHEIGHT/2))
 ) (
     input  logic clk,
@@ -16,22 +16,21 @@ module rasterizer #(
     input  logic [23:0] color,
     output logic done,
     // Framebuffer write (one 64-bit quad per cycle)
-    output logic                  fb_we,
     output logic [ADDR_WIDTH-1:0] fb_addr,
     output logic [63:0]           fb_data,
-    output logic [3:0]            fb_mask  // byte enable for each pixel
+    output logic [3:0]            fb_mask
 );
 
-    localparam CW = $clog2(RWIDTH);   // coordinate width for x
-    localparam CH = $clog2(RHEIGHT);   // coordinate width for y
-    localparam EW = CW + CH + 1;      // edge function width: product of two (CW+1)-bit * (CH+1)-bit signed values
+    localparam CW = $clog2(RWIDTH);
+    localparam CH = $clog2(RHEIGHT);
+    localparam EW = CW + CH + 1;
 
-    typedef enum logic [3:0] {
+    // --- Traversal FSM ---
+    typedef enum logic [2:0] {
         IDLE,
         SETUP,
-        INIT_QUAD,
-        RASTER_QUAD,
-        WRITE_QUAD
+        INIT_ROW,
+        TRAVERSE
     } state_t;
 
     state_t state;
@@ -47,12 +46,6 @@ module rasterizer #(
     logic signed [EW-1:0] e0_col, e1_col, e2_col;
     logic signed [EW-1:0] e0_dx, e1_dx, e2_dx;
     logic signed [EW-1:0] e0_dy, e1_dy, e2_dy;
-
-    // Quad pixel values
-    logic signed [EW-1:0] p0_e0, p0_e1, p0_e2;
-    logic signed [EW-1:0] p1_e0, p1_e1, p1_e2;
-    logic signed [EW-1:0] p2_e0, p2_e1, p2_e2;
-    logic signed [EW-1:0] p3_e0, p3_e1, p3_e2;
 
     // Convert 24-bit RGB to 16-bit RGB565
     logic [15:0] color_565;
@@ -88,27 +81,38 @@ module rasterizer #(
         return (a > b) ? ((a > c) ? a : c) : ((b > c) ? b : c);
     endfunction
 
+    // --- Pipeline stage: write to FB (1 cycle behind traversal) ---
+    logic pipe_valid;
+    logic signed [EW-1:0] pipe_e0, pipe_e1, pipe_e2;           // p0 (top-left)
+    logic signed [EW-1:0] pipe_e0_dx, pipe_e1_dx, pipe_e2_dx;  // p1 = p0 + dx
+    logic signed [EW-1:0] pipe_e0_dy, pipe_e1_dy, pipe_e2_dy;  // p2 = p0 + dy
+    logic signed [EW-1:0] pipe_e0_dxy, pipe_e1_dxy, pipe_e2_dxy; // p3 = p0 + dx + dy
+    logic [CW-1:0] pipe_qx;
+    logic [CH-1:0] pipe_qy;
+    logic [CW-1:0] pipe_maxx;
+    logic [CH-1:0] pipe_maxy;
+    logic [15:0]   pipe_color;
+
+    // Traversal FSM
     always_ff @(posedge clk) begin
         if (rst) begin
             state <= IDLE;
             done <= 0;
-            fb_we <= 0;
+            pipe_valid <= 0;
         end else begin
-            fb_we <= 0;
-            
-            
+            pipe_valid <= 0;
+
             case (state)
                 IDLE: begin
                     done <= 0;
                     if (start) begin
-                        // Compute bounding box aligned to 2x2 grid
                         logic [CW-1:0] tmp_minx, tmp_maxx;
                         logic [CH-1:0] tmp_miny, tmp_maxy;
                         tmp_minx = min3x(v0_x, v1_x, v2_x);
                         tmp_miny = min3y(v0_y, v1_y, v2_y);
                         tmp_maxx = max3x(v0_x, v1_x, v2_x);
                         tmp_maxy = max3y(v0_y, v1_y, v2_y);
-                        
+
                         minx <= {tmp_minx[CW-1:1], 1'b0};
                         miny <= {tmp_miny[CH-1:1], 1'b0};
                         maxx <= (tmp_maxx >= CW'(RWIDTH))  ? CW'(RWIDTH - 1)  : tmp_maxx;
@@ -118,7 +122,6 @@ module rasterizer #(
                 end
 
                 SETUP: begin
-                    // Compute edge deltas
                     e0_dx <= -EW'($signed({1'b0, v1_y}) - $signed({1'b0, v0_y}));
                     e0_dy <=  EW'($signed({1'b0, v1_x}) - $signed({1'b0, v0_x}));
                     e1_dx <= -EW'($signed({1'b0, v2_y}) - $signed({1'b0, v1_y}));
@@ -126,90 +129,92 @@ module rasterizer #(
                     e2_dx <= -EW'($signed({1'b0, v0_y}) - $signed({1'b0, v2_y}));
                     e2_dy <=  EW'($signed({1'b0, v0_x}) - $signed({1'b0, v2_x}));
 
-                    // Initial edge values at origin (minx, miny)
                     e0_row <= edge_func(v0_x, v0_y, v1_x, v1_y, minx, miny);
                     e1_row <= edge_func(v1_x, v1_y, v2_x, v2_y, minx, miny);
                     e2_row <= edge_func(v2_x, v2_y, v0_x, v0_y, minx, miny);
 
                     qx <= minx;
                     qy <= miny;
-                    state <= INIT_QUAD;
+                    state <= INIT_ROW;
                 end
-                
-                INIT_QUAD: begin
-                    // Initialize column values for first quad of row
+
+                INIT_ROW: begin
                     e0_col <= e0_row;
                     e1_col <= e1_row;
                     e2_col <= e2_row;
-                    state <= RASTER_QUAD;
+                    state <= TRAVERSE;
                 end
 
-                RASTER_QUAD: begin
+                TRAVERSE: begin
                     if (qy > maxy) begin
-                        state <= IDLE;
                         done <= 1;
+                        state <= IDLE;
                     end else begin
-                        // Compute all 4 pixels of quad
-                        p0_e0 <= e0_col;
-                        p0_e1 <= e1_col;
-                        p0_e2 <= e2_col;
-                        
-                        p1_e0 <= e0_col + e0_dx;
-                        p1_e1 <= e1_col + e1_dx;
-                        p1_e2 <= e2_col + e2_dx;
-                        
-                        p2_e0 <= e0_col + e0_dy;
-                        p2_e1 <= e1_col + e1_dy;
-                        p2_e2 <= e2_col + e2_dy;
-                        
-                        p3_e0 <= e0_col + e0_dx + e0_dy;
-                        p3_e1 <= e1_col + e1_dx + e1_dy;
-                        p3_e2 <= e2_col + e2_dx + e2_dy;
+                        // Feed pipeline with current quad's edge values
+                        pipe_valid <= 1;
+                        pipe_e0 <= e0_col;
+                        pipe_e1 <= e1_col;
+                        pipe_e2 <= e2_col;
+                        pipe_e0_dx <= e0_col + e0_dx;
+                        pipe_e1_dx <= e1_col + e1_dx;
+                        pipe_e2_dx <= e2_col + e2_dx;
+                        pipe_e0_dy <= e0_col + e0_dy;
+                        pipe_e1_dy <= e1_col + e1_dy;
+                        pipe_e2_dy <= e2_col + e2_dy;
+                        pipe_e0_dxy <= e0_col + e0_dx + e0_dy;
+                        pipe_e1_dxy <= e1_col + e1_dx + e1_dy;
+                        pipe_e2_dxy <= e2_col + e2_dx + e2_dy;
+                        pipe_qx <= qx;
+                        pipe_qy <= qy;
+                        pipe_maxx <= maxx;
+                        pipe_maxy <= maxy;
+                        pipe_color <= color_565;
 
-                        state <= WRITE_QUAD;
+                        // Advance to next quad
+                        if (qx + 2 > maxx) begin
+                            qx <= minx;
+                            qy <= qy + 2;
+                            e0_row <= e0_row + (e0_dy << 1);
+                            e1_row <= e1_row + (e1_dy << 1);
+                            e2_row <= e2_row + (e2_dy << 1);
+                            // Check if this was the last row
+                            state <= INIT_ROW;
+                        end else begin
+                            qx <= qx + 2;
+                            e0_col <= e0_col + (e0_dx << 1);
+                            e1_col <= e1_col + (e1_dx << 1);
+                            e2_col <= e2_col + (e2_dx << 1);
+                        end
                     end
                 end
 
-                WRITE_QUAD: begin
-                    // Compute quad address (qx/2, qy/2)
-                    logic [ADDR_WIDTH-1:0] quad_addr;
-                    logic [3:0] mask;
-                    
-                    quad_addr = ADDR_WIDTH'(qy >> 1) * ADDR_WIDTH'(RWIDTH >> 1) + ADDR_WIDTH'(qx >> 1);
-                    
-                    // Generate mask for valid pixels
-                    mask = {
-                        ((qy + 1) <= maxy && (qx + 1) <= maxx && p3_e0 >= 0 && p3_e1 >= 0 && p3_e2 >= 0),
-                        ((qy + 1) <= maxy && qx <= maxx && p2_e0 >= 0 && p2_e1 >= 0 && p2_e2 >= 0),
-                        (qy <= maxy && (qx + 1) <= maxx && p1_e0 >= 0 && p1_e1 >= 0 && p1_e2 >= 0),
-                        (qy <= maxy && qx <= maxx && p0_e0 >= 0 && p0_e1 >= 0 && p0_e2 >= 0)
-                    };
-                    
-                    // Pack 4 pixels
-                    fb_data <= {color_565, color_565, color_565, color_565};
-                    fb_addr <= quad_addr;
-                    fb_mask <= mask;
-                    fb_we <= |mask;  // Write if any pixel is valid
-
-                    // Move to next quad
-                    if (qx + 2 > maxx) begin
-                        qx <= minx;
-                        qy <= qy + 2;
-                        e0_row <= e0_row + (e0_dy << 1);
-                        e1_row <= e1_row + (e1_dy << 1);
-                        e2_row <= e2_row + (e2_dy << 1);
-                        state <= INIT_QUAD;
-                    end else begin
-                        qx <= qx + 2;
-                        e0_col <= e0_col + (e0_dx << 1);
-                        e1_col <= e1_col + (e1_dx << 1);
-                        e2_col <= e2_col + (e2_dx << 1);
-                        state <= RASTER_QUAD;
-                    end
-                end
-                
                 default: state <= IDLE;
             endcase
+        end
+    end
+
+    // --- Pipeline output stage: compute mask & address, drive FB ---
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            fb_mask <= 0;
+        end else if (pipe_valid) begin
+            logic [3:0] mask;
+            mask = {
+                ((pipe_qy + 1) <= pipe_maxy && (pipe_qx + 1) <= pipe_maxx &&
+                    pipe_e0_dxy >= 0 && pipe_e1_dxy >= 0 && pipe_e2_dxy >= 0),
+                ((pipe_qy + 1) <= pipe_maxy && pipe_qx <= pipe_maxx &&
+                    pipe_e0_dy >= 0 && pipe_e1_dy >= 0 && pipe_e2_dy >= 0),
+                (pipe_qy <= pipe_maxy && (pipe_qx + 1) <= pipe_maxx &&
+                    pipe_e0_dx >= 0 && pipe_e1_dx >= 0 && pipe_e2_dx >= 0),
+                (pipe_qy <= pipe_maxy && pipe_qx <= pipe_maxx &&
+                    pipe_e0 >= 0 && pipe_e1 >= 0 && pipe_e2 >= 0)
+            };
+
+            fb_addr <= ADDR_WIDTH'(pipe_qy >> 1) * ADDR_WIDTH'(RWIDTH >> 1) + ADDR_WIDTH'(pipe_qx >> 1);
+            fb_data <= {pipe_color, pipe_color, pipe_color, pipe_color};
+            fb_mask <= mask;
+        end else begin
+            fb_mask <= 0;
         end
     end
 
