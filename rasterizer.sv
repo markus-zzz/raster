@@ -1,29 +1,34 @@
 module rasterizer #(
-    parameter RWIDTH = 320,
-    parameter RHEIGHT = 200,
+    parameter RES_W = 320,
+    parameter RES_H = 200,
+    parameter TILE_W = 320,    // tile width (BRAM size)
+    parameter TILE_H = 200,    // tile height (BRAM size)
     parameter SUBPIXEL = 4,
-    parameter ADDR_WIDTH = $clog2((RWIDTH/2) * (RHEIGHT/2))
+    parameter ADDR_WIDTH = $clog2((TILE_W/2) * (TILE_H/2))
 ) (
     input  logic clk,
     input  logic rst,
-    // Triangle input (fixed-point: SUBPIXEL fractional bits)
+    // Tile offset in screen coordinates (pixel-aligned)
+    input  logic [$clog2(RES_W)-1:0] tile_x,
+    input  logic [$clog2(RES_H)-1:0] tile_y,
+    // Triangle input (fixed-point: SUBPIXEL fractional bits, screen-space)
     input  logic start,
-    input  logic [$clog2(RWIDTH)+SUBPIXEL-1:0] v0_x,
-    input  logic [$clog2(RHEIGHT)+SUBPIXEL-1:0] v0_y,
-    input  logic [$clog2(RWIDTH)+SUBPIXEL-1:0] v1_x,
-    input  logic [$clog2(RHEIGHT)+SUBPIXEL-1:0] v1_y,
-    input  logic [$clog2(RWIDTH)+SUBPIXEL-1:0] v2_x,
-    input  logic [$clog2(RHEIGHT)+SUBPIXEL-1:0] v2_y,
+    input  logic [$clog2(RES_W)+SUBPIXEL-1:0] v0_x,
+    input  logic [$clog2(RES_H)+SUBPIXEL-1:0] v0_y,
+    input  logic [$clog2(RES_W)+SUBPIXEL-1:0] v1_x,
+    input  logic [$clog2(RES_H)+SUBPIXEL-1:0] v1_y,
+    input  logic [$clog2(RES_W)+SUBPIXEL-1:0] v2_x,
+    input  logic [$clog2(RES_H)+SUBPIXEL-1:0] v2_y,
     input  logic signed [15:0] iz_init,  // 1/z at pixel (0,0)
     input  logic signed [15:0] iz_dx,    // d(1/z)/dx per pixel
     input  logic signed [15:0] iz_dy,    // d(1/z)/dy per pixel
     input  logic [23:0] color,
     output logic done,
-    // Framebuffer write
+    // Framebuffer write (tile-local addressing)
     output logic [ADDR_WIDTH-1:0] fb_addr,
     output logic [63:0]           fb_data,
     output logic [3:0]            fb_mask,
-    // Z-buffer interface
+    // Z-buffer interface (tile-local addressing)
     output logic [ADDR_WIDTH-1:0] zb_rd_addr,
     input  logic [15:0]           zb_rd_data [4],
     output logic [ADDR_WIDTH-1:0] zb_wr_addr,
@@ -31,11 +36,13 @@ module rasterizer #(
     output logic [3:0]            zb_wr_mask
 );
 
-    localparam CW = $clog2(RWIDTH);   // pixel coordinate width
-    localparam CH = $clog2(RHEIGHT);
+    localparam CW = $clog2(RES_W);   // pixel coordinate width
+    localparam CH = $clog2(RES_H);
     localparam VW = CW + SUBPIXEL;    // vertex coordinate width (with sub-pixel)
     localparam VH = CH + SUBPIXEL;
     localparam EW = VW + VH + 1;      // edge function width
+    localparam TWB = $clog2(TILE_W); // tile width in bits (for BRAM addressing)
+    localparam THB = $clog2(TILE_H);
 
     typedef enum logic [2:0] {
         IDLE,
@@ -175,6 +182,23 @@ module rasterizer #(
     logic [ADDR_WIDTH-1:0] p2_addr;
     logic [15:0] p2_color;
 
+    // Tile bbox clamping (combinational)
+    logic [CW-1:0] tile_xmax_p1;
+    logic [CH-1:0] tile_ymax_p1;
+    logic [CW-1:0] clamped_minx, clamped_maxx;
+    logic [CH-1:0] clamped_miny, clamped_maxy;
+    logic          bbox_empty;
+
+    always_comb begin
+        tile_xmax_p1 = tile_x + CW'(TILE_W);
+        tile_ymax_p1 = tile_y + CH'(TILE_H);
+        clamped_minx = (bbox_minx < tile_x) ? tile_x : bbox_minx;
+        clamped_miny = (bbox_miny < tile_y) ? tile_y : bbox_miny;
+        clamped_maxx = (bbox_maxx >= tile_xmax_p1) ? tile_xmax_p1 - 1 : bbox_maxx;
+        clamped_maxy = (bbox_maxy >= tile_ymax_p1) ? tile_ymax_p1 - 1 : bbox_maxy;
+        bbox_empty = (clamped_minx > clamped_maxx) || (clamped_miny > clamped_maxy);
+    end
+
     // Traversal FSM
     always_ff @(posedge clk) begin
         if (rst) begin
@@ -188,13 +212,15 @@ module rasterizer #(
                 IDLE: begin
                     done <= 0;
                     if (start) begin
-                        minx <= {bbox_minx[CW-1:1], 1'b0};
-                        miny <= {bbox_miny[CH-1:1], 1'b0};
-                        maxx <= (bbox_maxx >= CW'(RWIDTH))
-                                ? CW'(RWIDTH - 1) : bbox_maxx;
-                        maxy <= (bbox_maxy >= CH'(RHEIGHT))
-                                ? CH'(RHEIGHT - 1) : bbox_maxy;
-                        state <= SETUP;
+                        if (bbox_empty) begin
+                            done <= 1;
+                        end else begin
+                            minx <= {clamped_minx[CW-1:1], 1'b0};
+                            miny <= {clamped_miny[CH-1:1], 1'b0};
+                            maxx <= clamped_maxx;
+                            maxy <= clamped_maxy;
+                            state <= SETUP;
+                        end
                     end
                 end
 
@@ -214,7 +240,7 @@ module rasterizer #(
                     // iz_init is 1/z at pixel (0,0); compute value at bbox origin
                     iz_dx_r <= iz_dx;
                     iz_dy_r <= iz_dy;
-                    iz_row <= iz_init;
+                    iz_row <= iz_init + iz_dx * $signed({1'b0, minx}) + iz_dy * $signed({1'b0, miny});
 
                     qx <= minx;
                     qy <= miny;
@@ -287,8 +313,13 @@ module rasterizer #(
     end
 
     // --- Pipeline stage 1: inside mask + z-buffer read ---
+    // Tile-local quad address: ((qy - tile_y) >> 1) * (TILE_W >> 1) + ((qx - tile_x) >> 1)
     logic [ADDR_WIDTH-1:0] p1_addr;
-    assign p1_addr = ADDR_WIDTH'(p1_qy >> 1) * ADDR_WIDTH'(RWIDTH >> 1) + ADDR_WIDTH'(p1_qx >> 1);
+    logic [CW-1:0] p1_qx_local;
+    logic [CH-1:0] p1_qy_local;
+    assign p1_qx_local = p1_qx - tile_x;
+    assign p1_qy_local = p1_qy - tile_y;
+    assign p1_addr = ADDR_WIDTH'(p1_qy_local >> 1) * ADDR_WIDTH'(TILE_W >> 1) + ADDR_WIDTH'(p1_qx_local >> 1);
     assign zb_rd_addr = p1_addr;
 
     always_ff @(posedge clk) begin

@@ -1,7 +1,5 @@
 #include <verilated.h>
 #include "Vraster_top.h"
-#include "Vraster_top_raster_top.h"
-#include "Vraster_top_dpram__Ae_DB3e80.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -9,11 +7,25 @@
 #include <algorithm>
 #include <vector>
 
+// Screen
 static const int W = 320, H = 200;
+// Tile (must match HW parameters)
+static const int TW = 64, TH = 64;
+static const int NTX = (W + TW - 1) / TW;  // 5
+static const int NTY = (H + TH - 1) / TH;  // 4 (last partial)
+
 static uint32_t fb_hw[H][W];
 
 struct Vec3 { float x, y, z; };
 struct Face { int v[3]; };
+struct Vec2i { int x, y; };
+
+struct Tri2D {
+    Vec2i p[3];
+    float iz[3];
+    uint32_t color;
+    int bbminx, bbminy, bbmaxx, bbmaxy;
+};
 
 std::vector<Vec3> vertices;
 std::vector<Face> faces;
@@ -28,148 +40,164 @@ void load_obj(const char *path) {
             sscanf(line + 2, "%f %f %f", &v.x, &v.y, &v.z);
             vertices.push_back(v);
         } else if (line[0] == 'f' && line[1] == ' ') {
-            // Parse face (may have v//vn or v/vt/vn format)
-            Face face;
             int vi[4] = {0}, count = 0;
             char *p = line + 2;
             while (*p && count < 4) {
-                vi[count] = atoi(p) - 1; // OBJ is 1-indexed
-                count++;
+                vi[count++] = atoi(p) - 1;
                 while (*p && *p != ' ' && *p != '\n') p++;
                 while (*p == ' ') p++;
             }
-            // Triangulate quads
-            face.v[0] = vi[0]; face.v[1] = vi[1]; face.v[2] = vi[2];
-            faces.push_back(face);
-            if (count == 4) {
-                face.v[0] = vi[0]; face.v[1] = vi[2]; face.v[2] = vi[3];
-                faces.push_back(face);
-            }
+            faces.push_back({{vi[0], vi[1], vi[2]}});
+            if (count == 4) faces.push_back({{vi[0], vi[2], vi[3]}});
         }
     }
     fclose(f);
     printf("Loaded %zu vertices, %zu triangles\n", vertices.size(), faces.size());
 }
 
-struct Vec2i { int x, y; };
-
-void project(const Vec3 *verts, int nv, float angle_y, float angle_x,
-             Vec2i *out, float *out_iz) {
+void project(float angle_y, float angle_x,
+             std::vector<Vec2i> &proj, std::vector<float> &proj_iz) {
     float cy = cosf(angle_y), sy = sinf(angle_y);
     float cx = cosf(angle_x), sx = sinf(angle_x);
     float scale = 80.0f;
-
+    int nv = vertices.size();
+    proj.resize(nv);
+    proj_iz.resize(nv);
     for (int i = 0; i < nv; i++) {
-        // Flip Y to put model upright (screen Y increases downward)
-        float x = verts[i].x, y = -verts[i].y, z = verts[i].z;
-        float rx = x * cy + z * sy;
-        float rz = -x * sy + z * cy;
-        float ry = y * cx - rz * sx;
-        float rz2 = y * sx + rz * cx;
-
-        // Orthographic projection + scale to screen
-        out[i].x = (int)((rx * scale) + W/2);
-        out[i].y = (int)((ry * scale) + H/2);
-        // 1/z: closer to camera (larger rz2) should have larger iz
-        out_iz[i] = 275.0f + rz2 * 225.0f;
-        if (out_iz[i] < 1.0f) out_iz[i] = 1.0f;
+        float x = vertices[i].x, y = -vertices[i].y, z = vertices[i].z;
+        float rx = x*cy + z*sy;
+        float rz = -x*sy + z*cy;
+        float ry = y*cx - rz*sx;
+        float rz2 = y*sx + rz*cx;
+        proj[i].x = (int)(rx*scale + W/2);
+        proj[i].y = (int)(ry*scale + H/2);
+        proj_iz[i] = 275.0f + rz2*225.0f;
+        if (proj_iz[i] < 1.0f) proj_iz[i] = 1.0f;
     }
 }
 
-void draw_triangle_hw(Vraster_top *dut, Vec2i v0, Vec2i v1, Vec2i v2,
-                      float iz0, float iz1, float iz2,
-                      uint32_t color) {
+uint32_t shade_face(Vec3 v0, Vec3 v1, Vec3 v2, float angle_y, float angle_x) {
+    Vec3 e1 = {v1.x-v0.x, v1.y-v0.y, v1.z-v0.z};
+    Vec3 e2 = {v2.x-v0.x, v2.y-v0.y, v2.z-v0.z};
+    Vec3 n = {e1.y*e2.z - e1.z*e2.y, e1.z*e2.x - e1.x*e2.z, e1.x*e2.y - e1.y*e2.x};
+    float len = sqrtf(n.x*n.x + n.y*n.y + n.z*n.z);
+    if (len < 1e-6f) return 0x404040;
+    n.x /= len; n.y /= len; n.z /= len;
+    float cy = cosf(angle_y), sy = sinf(angle_y);
+    float cx = cosf(angle_x), sx = sinf(angle_x);
+    float nx2 = n.x*cy + n.z*sy;
+    float nz2 = -n.x*sy + n.z*cy;
+    float ny2 = n.y*cx - nz2*sx;
+    float nz3 = n.y*sx + nz2*cx;
+    float lx = 0.186f, ly = 0.279f, lz = 0.932f;
+    float dot = nx2*lx + ny2*ly + nz3*lz;
+    if (dot < 0) dot = 0;
+    float intensity = 0.2f + 0.8f*dot;
+    float rb = 0.5f + 0.5f*n.x, gb = 0.5f + 0.5f*n.y, bb = 0.5f + 0.5f*n.z;
+    uint8_t r = (uint8_t)(intensity*rb*255);
+    uint8_t g = (uint8_t)(intensity*gb*255);
+    uint8_t b = (uint8_t)(intensity*bb*255);
+    return (r<<16)|(g<<8)|b;
+}
+
+void clear_tile(Vraster_top *dut) {
+    dut->clear = 1;
+    dut->clk = 0; dut->eval();
+    dut->clk = 1; dut->eval();
+    dut->clear = 0;
+
+    int timeout = 10000;
+    while (!dut->clear_done && timeout-- > 0) {
+        dut->clk = 0; dut->eval();
+        dut->clk = 1; dut->eval();
+    }
+}
+
+void draw_triangle_hw(Vraster_top *dut, const Tri2D &t, int tile_ox, int tile_oy) {
     const int SP = 16;
-    // Skip if any vertex is off-screen (simple guard — no real clipping)
-    auto offscreen = [](Vec2i v) { return v.x < 0 || v.x >= W || v.y < 0 || v.y >= H; };
-    if (offscreen(v0) || offscreen(v1) || offscreen(v2)) return;
 
-    // Compute 1/z plane equation: iz(x,y) = iz_init + iz_dx*x + iz_dy*y
-    // Using barycentric interpolation divided by area
-    float area = (float)((v1.x - v0.x) * (v2.y - v0.y) - (v1.y - v0.y) * (v2.x - v0.x));
+    // Skip if entirely off-screen
+    if ((t.p[0].x < 0 && t.p[1].x < 0 && t.p[2].x < 0) ||
+        (t.p[0].x >= W && t.p[1].x >= W && t.p[2].x >= W) ||
+        (t.p[0].y < 0 && t.p[1].y < 0 && t.p[2].y < 0) ||
+        (t.p[0].y >= H && t.p[1].y >= H && t.p[2].y >= H)) return;
+
+    // For now, conservative skip if any vertex is outside screen.
+    // (Hardware uses unsigned vertex inputs; negative would wrap.)
+    for (int i = 0; i < 3; i++) {
+        if (t.p[i].x < 0 || t.p[i].x >= W || t.p[i].y < 0 || t.p[i].y >= H) return;
+    }
+
+    // 1/z plane gradients (in screen space)
+    float area = (float)((t.p[1].x - t.p[0].x) * (t.p[2].y - t.p[0].y) -
+                         (t.p[1].y - t.p[0].y) * (t.p[2].x - t.p[0].x));
     if (fabsf(area) < 0.001f) return;
+    float diz_dx = ((t.iz[1]-t.iz[0])*(t.p[2].y-t.p[0].y) -
+                    (t.iz[2]-t.iz[0])*(t.p[1].y-t.p[0].y)) / area;
+    float diz_dy = ((t.iz[2]-t.iz[0])*(t.p[1].x-t.p[0].x) -
+                    (t.iz[1]-t.iz[0])*(t.p[2].x-t.p[0].x)) / area;
 
-    // Gradients: diz/dx and diz/dy
-    float diz_dx = ((iz1 - iz0) * (v2.y - v0.y) - (iz2 - iz0) * (v1.y - v0.y)) / area;
-    float diz_dy = ((iz2 - iz0) * (v1.x - v0.x) - (iz1 - iz0) * (v2.x - v0.x)) / area;
+    // iz at the clamped bbox origin (matching what HW will use)
+    int tile_xmax = std::min(tile_ox + TW - 1, W - 1);
+    int tile_ymax = std::min(tile_oy + TH - 1, H - 1);
+    int bbminx = std::max(tile_ox, std::min({t.p[0].x, t.p[1].x, t.p[2].x}));
+    int bbminy = std::max(tile_oy, std::min({t.p[0].y, t.p[1].y, t.p[2].y}));
+    int bbmaxx = std::min(tile_xmax, std::max({t.p[0].x, t.p[1].x, t.p[2].x}));
+    int bbmaxy = std::min(tile_ymax, std::max({t.p[0].y, t.p[1].y, t.p[2].y}));
+    if (bbminx > bbmaxx || bbminy > bbmaxy) return;
+    bbminx &= ~1;
+    bbminy &= ~1;
 
-    // Compute iz at bounding box origin (what the HW will use as starting point)
-    int bbminx = std::min({v0.x, v1.x, v2.x}) & ~1;
-    int bbminy = std::min({v0.y, v1.y, v2.y}) & ~1;
-    if (bbminx < 0) bbminx = 0;
-    if (bbminy < 0) bbminy = 0;
-    float iz_at_bb = iz0 + diz_dx * (bbminx - v0.x) + diz_dy * (bbminy - v0.y);
+    float iz_at_bb = t.iz[0] + diz_dx * (bbminx - t.p[0].x) + diz_dy * (bbminy - t.p[0].y);
 
-    // Scale by 32 for better z precision. Max iz value: 500*32=16000, fits int16.
-    // Max gradient per pixel * 32 ~ small (Suzanne spans ~160px, iz range ~450, grad~3*32=96)
-    // iz_at_bb max: 500*32=16000, well within int16 range
     int16_t iz_init_fp = (int16_t)roundf(iz_at_bb * 32.0f);
     int16_t iz_dx_fp = (int16_t)roundf(diz_dx * 32.0f);
     int16_t iz_dy_fp = (int16_t)roundf(diz_dy * 32.0f);
 
-    dut->v0_x = v0.x * SP + SP/2;
-    dut->v0_y = v0.y * SP + SP/2;
-    dut->v1_x = v1.x * SP + SP/2;
-    dut->v1_y = v1.y * SP + SP/2;
-    dut->v2_x = v2.x * SP + SP/2;
-    dut->v2_y = v2.y * SP + SP/2;
+    dut->tile_x = tile_ox;
+    dut->tile_y = tile_oy;
+    dut->v0_x = t.p[0].x * SP + SP/2;
+    dut->v0_y = t.p[0].y * SP + SP/2;
+    dut->v1_x = t.p[1].x * SP + SP/2;
+    dut->v1_y = t.p[1].y * SP + SP/2;
+    dut->v2_x = t.p[2].x * SP + SP/2;
+    dut->v2_y = t.p[2].y * SP + SP/2;
     dut->iz_init = iz_init_fp;
     dut->iz_dx = iz_dx_fp;
     dut->iz_dy = iz_dy_fp;
-    dut->color = color;
+    dut->color = t.color;
     dut->start = 1;
     dut->clk = 0; dut->eval();
     dut->clk = 1; dut->eval();
     dut->start = 0;
 
-    int timeout = 500000;
+    int timeout = 100000;
     while (!dut->done && timeout-- > 0) {
         dut->clk = 0; dut->eval();
         dut->clk = 1; dut->eval();
     }
-    if (timeout <= 0) printf("ERROR: timeout\n");
+    if (timeout <= 0) printf("ERROR: timeout (tile %d,%d)\n", tile_ox, tile_oy);
 }
 
-void clear_hw(Vraster_top *dut) {
-    dut->rst = 1;
-    dut->clk = 0; dut->eval();
-    dut->clk = 1; dut->eval();
-    dut->rst = 0;
-
-    const int NUM_QUADS = (W/2) * (H/2);
-    auto *top = dut->raster_top;
-    for (int i = 0; i < NUM_QUADS; i++) {
-        top->zb_banks__BRA__0__KET____DOT__zb->mem[i] = 0;
-        top->zb_banks__BRA__1__KET____DOT__zb->mem[i] = 0;
-        top->zb_banks__BRA__2__KET____DOT__zb->mem[i] = 0;
-        top->zb_banks__BRA__3__KET____DOT__zb->mem[i] = 0;
-        top->fb_banks__BRA__0__KET____DOT__fb->mem[i] = 0;
-        top->fb_banks__BRA__1__KET____DOT__fb->mem[i] = 0;
-        top->fb_banks__BRA__2__KET____DOT__fb->mem[i] = 0;
-        top->fb_banks__BRA__3__KET____DOT__fb->mem[i] = 0;
-    }
-}
-
-void read_fb(Vraster_top *dut) {
-    for (int y = 0; y < H; y++) {
-        for (int x = 0; x < W; x++) {
-            int quad_x = x / 2;
-            int quad_y = y / 2;
-            int pixel_idx = (y % 2) * 2 + (x % 2);
-            dut->fb_rd_pixel_addr = (quad_y * (W/2) + quad_x) * 4 + pixel_idx;
+void read_tile(Vraster_top *dut, int tile_ox, int tile_oy) {
+    for (int y = 0; y < TH && (tile_oy + y) < H; y++) {
+        for (int x = 0; x < TW && (tile_ox + x) < W; x++) {
+            int qx = x / 2, qy = y / 2;
+            int pidx = (y % 2) * 2 + (x % 2);
+            dut->fb_rd_pixel_addr = (qy * (TW/2) + qx) * 4 + pidx;
             dut->clk = 0; dut->eval();
             dut->clk = 1; dut->eval();
-            uint16_t rgb565 = dut->fb_rd_data;
-            uint8_t r = (rgb565 >> 11) << 3;
-            uint8_t g = ((rgb565 >> 5) & 0x3F) << 2;
-            uint8_t b = (rgb565 & 0x1F) << 3;
-            fb_hw[y][x] = (r << 16) | (g << 8) | b;
+            uint16_t c = dut->fb_rd_data;
+            uint8_t r = (c >> 11) << 3;
+            uint8_t g = ((c >> 5) & 0x3F) << 2;
+            uint8_t b = (c & 0x1F) << 3;
+            fb_hw[tile_oy + y][tile_ox + x] = (r << 16) | (g << 8) | b;
         }
     }
 }
 
-void write_ppm(const char *filename) {
-    FILE *f = fopen(filename, "wb");
+void write_ppm(const char *fn) {
+    FILE *f = fopen(fn, "wb");
     fprintf(f, "P6\n%d %d\n255\n", W, H);
     for (int y = 0; y < H; y++)
         for (int x = 0; x < W; x++) {
@@ -180,41 +208,6 @@ void write_ppm(const char *filename) {
     fclose(f);
 }
 
-// Simple face normal for flat shading — compute in view space
-uint32_t shade_face(Vec3 v0, Vec3 v1, Vec3 v2, float angle_y, float angle_x) {
-    // Face normal in object space
-    Vec3 e1 = {v1.x-v0.x, v1.y-v0.y, v1.z-v0.z};
-    Vec3 e2 = {v2.x-v0.x, v2.y-v0.y, v2.z-v0.z};
-    Vec3 n = {e1.y*e2.z - e1.z*e2.y, e1.z*e2.x - e1.x*e2.z, e1.x*e2.y - e1.y*e2.x};
-    float len = sqrtf(n.x*n.x + n.y*n.y + n.z*n.z);
-    if (len < 1e-6f) return 0x404040;
-    n.x /= len; n.y /= len; n.z /= len;
-
-    // Rotate normal to view space
-    float cy = cosf(angle_y), sy = sinf(angle_y);
-    float cx = cosf(angle_x), sx = sinf(angle_x);
-    float nx2 = n.x * cy + n.z * sy;
-    float nz2 = -n.x * sy + n.z * cy;
-    float ny2 = n.y * cx - nz2 * sx;
-    float nz3 = n.y * sx + nz2 * cx;
-
-    // Light direction
-    float lx = 0.186f, ly = 0.279f, lz = 0.932f;
-    float dot = nx2 * lx + ny2 * ly + nz3 * lz;
-    if (dot < 0) dot = 0;
-    float intensity = 0.2f + 0.8f * dot;
-
-    // Color from object-space normal direction (gives each face a unique hue)
-    float r_base = 0.5f + 0.5f * n.x;
-    float g_base = 0.5f + 0.5f * n.y;
-    float b_base = 0.5f + 0.5f * n.z;
-
-    uint8_t r = (uint8_t)(intensity * r_base * 255);
-    uint8_t g = (uint8_t)(intensity * g_base * 255);
-    uint8_t b = (uint8_t)(intensity * b_base * 255);
-    return (r << 16) | (g << 8) | b;
-}
-
 int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
     Vraster_top *dut = new Vraster_top;
@@ -222,46 +215,78 @@ int main(int argc, char **argv) {
     load_obj("suzanne.obj");
     if (vertices.empty()) return 1;
 
+    printf("Screen: %dx%d, Tile: %dx%d, Grid: %dx%d = %d tiles\n",
+           W, H, TW, TH, NTX, NTY, NTX*NTY);
+
     const int NUM_FRAMES = 90;
-    int nv = vertices.size();
-    std::vector<Vec2i> proj(nv);
-    std::vector<float> proj_iz(nv);
+    std::vector<Vec2i> proj;
+    std::vector<float> proj_iz;
+    std::vector<Tri2D> tris;
 
     for (int frame = 0; frame < NUM_FRAMES; frame++) {
-        clear_hw(dut);
+        memset(fb_hw, 0, sizeof(fb_hw));
 
         float angle_y = frame * 2.0f * M_PI / NUM_FRAMES;
-        float angle_x = -0.3f; // slight tilt (negative to flip upright)
+        float angle_x = -0.3f;
 
-        project(vertices.data(), nv, angle_y, angle_x, proj.data(), proj_iz.data());
+        project(angle_y, angle_x, proj, proj_iz);
 
-        int drawn = 0;
+        // Build visible triangle list
+        tris.clear();
         for (auto &face : faces) {
             Vec2i p0 = proj[face.v[0]], p1 = proj[face.v[1]], p2 = proj[face.v[2]];
-            float iz0 = proj_iz[face.v[0]];
-            float iz1 = proj_iz[face.v[1]];
-            float iz2 = proj_iz[face.v[2]];
-
-            // Back-face culling (Y negated in projection flips winding)
             int cross = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
             if (cross >= 0) continue;
-
-            uint32_t color = shade_face(vertices[face.v[0]], vertices[face.v[1]],
-                                        vertices[face.v[2]], angle_y, angle_x);
-
-            draw_triangle_hw(dut, p0, p2, p1, iz0, iz2, iz1, color);
-            drawn++;
+            Tri2D t;
+            // Swap v1/v2 to fix winding
+            t.p[0] = p0; t.p[1] = p2; t.p[2] = p1;
+            t.iz[0] = proj_iz[face.v[0]];
+            t.iz[1] = proj_iz[face.v[2]];
+            t.iz[2] = proj_iz[face.v[1]];
+            t.color = shade_face(vertices[face.v[0]], vertices[face.v[1]],
+                                 vertices[face.v[2]], angle_y, angle_x);
+            t.bbminx = std::min({p0.x, p1.x, p2.x});
+            t.bbminy = std::min({p0.y, p1.y, p2.y});
+            t.bbmaxx = std::max({p0.x, p1.x, p2.x});
+            t.bbmaxy = std::max({p0.y, p1.y, p2.y});
+            tris.push_back(t);
         }
 
-        read_fb(dut);
+        // SW binning + tile rendering
+        int total_drawn = 0;
+        for (int ty = 0; ty < NTY; ty++) {
+            for (int tx = 0; tx < NTX; tx++) {
+                int tile_ox = tx * TW;
+                int tile_oy = ty * TH;
+                int tile_xmax = std::min(tile_ox + TW - 1, W - 1);
+                int tile_ymax = std::min(tile_oy + TH - 1, H - 1);
 
-        char filename[64];
-        snprintf(filename, sizeof(filename), "frame_%03d.ppm", frame);
-        write_ppm(filename);
-        printf("Frame %03d: %d triangles drawn\n", frame, drawn);
+                // Build bin: triangles whose bbox overlaps this tile
+                std::vector<int> bin;
+                for (int i = 0; i < (int)tris.size(); i++) {
+                    const auto &t = tris[i];
+                    if (t.bbmaxx < tile_ox || t.bbminx > tile_xmax) continue;
+                    if (t.bbmaxy < tile_oy || t.bbminy > tile_ymax) continue;
+                    bin.push_back(i);
+                }
+                if (bin.empty()) continue;
+
+                clear_tile(dut);
+                for (int idx : bin) {
+                    draw_triangle_hw(dut, tris[idx], tile_ox, tile_oy);
+                    total_drawn++;
+                }
+                read_tile(dut, tile_ox, tile_oy);
+            }
+        }
+
+        char fn[64];
+        snprintf(fn, sizeof(fn), "frame_%03d.ppm", frame);
+        write_ppm(fn);
+        printf("Frame %03d: %zu tris, %d submissions\n", frame, tris.size(), total_drawn);
     }
 
-    printf("\nDone: %d frames rendered\n", NUM_FRAMES);
+    printf("\nDone\n");
     delete dut;
     return 0;
 }
