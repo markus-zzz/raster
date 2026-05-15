@@ -10,7 +10,7 @@ module raster_top #(
     input  logic start,
     input  logic [$clog2(WIDTH)+SUBPIXEL-1:0] v0_x, v1_x, v2_x,
     input  logic [$clog2(HEIGHT)+SUBPIXEL-1:0] v0_y, v1_y, v2_y,
-    input  logic [15:0] v0_iz, v1_iz, v2_iz,
+    input  logic signed [15:0] iz_init, iz_dx, iz_dy,
     input  logic [23:0] color,
     output logic done,
     // Framebuffer read port
@@ -42,7 +42,7 @@ module raster_top #(
         .v0_x(v0_x), .v0_y(v0_y),
         .v1_x(v1_x), .v1_y(v1_y),
         .v2_x(v2_x), .v2_y(v2_y),
-        .v0_iz(v0_iz), .v1_iz(v1_iz), .v2_iz(v2_iz),
+        .iz_init(iz_init), .iz_dx(iz_dx), .iz_dy(iz_dy),
         .color(color),
         .done(done),
         .fb_addr(fb_wr_addr),

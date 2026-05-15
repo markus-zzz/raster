@@ -14,7 +14,9 @@ module rasterizer #(
     input  logic [$clog2(RHEIGHT)+SUBPIXEL-1:0] v1_y,
     input  logic [$clog2(RWIDTH)+SUBPIXEL-1:0] v2_x,
     input  logic [$clog2(RHEIGHT)+SUBPIXEL-1:0] v2_y,
-    input  logic [15:0] v0_iz, v1_iz, v2_iz,
+    input  logic signed [15:0] iz_init,  // 1/z at pixel (0,0)
+    input  logic signed [15:0] iz_dx,    // d(1/z)/dx per pixel
+    input  logic signed [15:0] iz_dy,    // d(1/z)/dy per pixel
     input  logic [23:0] color,
     output logic done,
     // Framebuffer write
@@ -34,7 +36,6 @@ module rasterizer #(
     localparam VW = CW + SUBPIXEL;    // vertex coordinate width (with sub-pixel)
     localparam VH = CH + SUBPIXEL;
     localparam EW = VW + VH + 1;      // edge function width
-    localparam IZ_FRAC = 16 + EW;
 
     typedef enum logic [2:0] {
         IDLE,
@@ -57,9 +58,9 @@ module rasterizer #(
     logic signed [EW-1:0] e0_dx, e1_dx, e2_dx;  // per-pixel step in x
     logic signed [EW-1:0] e0_dy, e1_dy, e2_dy;  // per-pixel step in y
 
-    // 1/z interpolation
-    logic signed [IZ_FRAC-1:0] iz_row, iz_col;
-    logic signed [IZ_FRAC-1:0] iz_dx, iz_dy;
+    // 1/z interpolation (pre-computed plane, 16-bit fixed-point)
+    logic signed [15:0] iz_row, iz_col;
+    logic signed [15:0] iz_dx_r, iz_dy_r;
 
     // Top-left rule
     logic tl0, tl1, tl2;
@@ -160,7 +161,7 @@ module rasterizer #(
     logic signed [EW-1:0] p1_e0_dy, p1_e1_dy, p1_e2_dy;
     logic signed [EW-1:0] p1_e0_dxy, p1_e1_dxy, p1_e2_dxy;
     logic p1_tl0, p1_tl1, p1_tl2;
-    logic signed [IZ_FRAC-1:0] p1_iz [4];
+    logic signed [15:0] p1_iz [4];
     logic [CW-1:0] p1_qx;
     logic [CH-1:0] p1_qy;
     logic [CW-1:0] p1_maxx;
@@ -210,15 +211,10 @@ module rasterizer #(
                     tl1 <= (setup_e1_dx > 0) || (setup_e1_dx == 0 && setup_e1_dy < 0);
                     tl2 <= (setup_e2_dx > 0) || (setup_e2_dx == 0 && setup_e2_dy < 0);
 
-                    iz_dx <= IZ_FRAC'(setup_e1_dx * $signed({1'b0, v0_iz}))
-                           + IZ_FRAC'(setup_e2_dx * $signed({1'b0, v1_iz}))
-                           + IZ_FRAC'(setup_e0_dx * $signed({1'b0, v2_iz}));
-                    iz_dy <= IZ_FRAC'(setup_e1_dy * $signed({1'b0, v0_iz}))
-                           + IZ_FRAC'(setup_e2_dy * $signed({1'b0, v1_iz}))
-                           + IZ_FRAC'(setup_e0_dy * $signed({1'b0, v2_iz}));
-                    iz_row <= IZ_FRAC'(setup_e1_init * $signed({1'b0, v0_iz}))
-                            + IZ_FRAC'(setup_e2_init * $signed({1'b0, v1_iz}))
-                            + IZ_FRAC'(setup_e0_init * $signed({1'b0, v2_iz}));
+                    // iz_init is 1/z at pixel (0,0); compute value at bbox origin
+                    iz_dx_r <= iz_dx;
+                    iz_dy_r <= iz_dy;
+                    iz_row <= iz_init;
 
                     qx <= minx;
                     qy <= miny;
@@ -257,9 +253,9 @@ module rasterizer #(
                         p1_tl2 <= tl2;
 
                         p1_iz[0] <= iz_col;
-                        p1_iz[1] <= iz_col + iz_dx;
-                        p1_iz[2] <= iz_col + iz_dy;
-                        p1_iz[3] <= iz_col + iz_dx + iz_dy;
+                        p1_iz[1] <= iz_col + iz_dx_r;
+                        p1_iz[2] <= iz_col + iz_dy_r;
+                        p1_iz[3] <= iz_col + iz_dx_r + iz_dy_r;
 
                         p1_qx <= qx;
                         p1_qy <= qy;
@@ -273,14 +269,14 @@ module rasterizer #(
                             e0_row <= e0_row + (e0_dy << 1);
                             e1_row <= e1_row + (e1_dy << 1);
                             e2_row <= e2_row + (e2_dy << 1);
-                            iz_row <= iz_row + (iz_dy <<< 1);
+                            iz_row <= iz_row + (iz_dy_r <<< 1);
                             state <= INIT_ROW;
                         end else begin
                             qx <= qx + 2;
                             e0_col <= e0_col + (e0_dx << 1);
                             e1_col <= e1_col + (e1_dx << 1);
                             e2_col <= e2_col + (e2_dx << 1);
-                            iz_col <= iz_col + (iz_dx <<< 1);
+                            iz_col <= iz_col + (iz_dx_r <<< 1);
                         end
                     end
                 end
@@ -319,7 +315,7 @@ module rasterizer #(
                                  (p1_e2_dxy > 0 || (p1_e2_dxy == 0 && p1_tl2)));
 
                 for (int i = 0; i < 4; i++)
-                    p2_iz[i] <= p1_iz[i][IZ_FRAC-1 -: 16];
+                    p2_iz[i] <= p1_iz[i];
 
                 p2_addr <= p1_addr;
                 p2_color <= p1_color;

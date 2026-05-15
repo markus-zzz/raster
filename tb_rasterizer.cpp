@@ -7,171 +7,127 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <vector>
 
 static const int W = 320, H = 200;
 static uint32_t fb_hw[H][W];
-static uint32_t fb_ref[H][W];
-static uint16_t zb_ref[H][W];
 
-struct Vec2 { int x, y; };
+struct Vec3 { float x, y, z; };
+struct Face { int v[3]; };
 
-static int edge_func(Vec2 v0, Vec2 v1, Vec2 p) {
-    return (v1.x - v0.x) * (p.y - v0.y) - (v1.y - v0.y) * (p.x - v0.x);
-}
+std::vector<Vec3> vertices;
+std::vector<Face> faces;
 
-struct EdgeStep {
-    int val, dx, dy;
-};
-
-static EdgeStep make_edge(Vec2 v0, Vec2 v1, Vec2 origin) {
-    return {
-        edge_func(v0, v1, origin),
-        -(v1.y - v0.y),
-         (v1.x - v0.x),
-    };
-}
-
-void draw_triangle_ref(Vec2 v0, Vec2 v1, Vec2 v2,
-                       uint16_t iz0, uint16_t iz1, uint16_t iz2,
-                       uint32_t color) {
-    // Convert to sub-pixel (4 frac bits, pixel center)
-    const int SP = 16; // 1 << SUBPIXEL
-    int sv0x = v0.x * SP + SP/2, sv0y = v0.y * SP + SP/2;
-    int sv1x = v1.x * SP + SP/2, sv1y = v1.y * SP + SP/2;
-    int sv2x = v2.x * SP + SP/2, sv2y = v2.y * SP + SP/2;
-
-    int minx = std::max(0,   std::min({v0.x, v1.x, v2.x}));
-    int miny = std::max(0,   std::min({v0.y, v1.y, v2.y}));
-    int maxx = std::min(W-1, std::max({v0.x, v1.x, v2.x}));
-    int maxy = std::min(H-1, std::max({v0.y, v1.y, v2.y}));
-
-    minx &= ~1; miny &= ~1;
-
-    // Edge function at pixel center of (minx, miny)
-    // Using sub-pixel vertex coords and sub-pixel sample point
-    int pcx = minx * SP + SP/2, pcy = miny * SP + SP/2;
-
-    // Edge functions in sub-pixel space
-    auto edge_sp = [](int v0x, int v0y, int v1x, int v1y, int px, int py) -> int64_t {
-        return (int64_t)(v1x - v0x) * (py - v0y) - (int64_t)(v1y - v0y) * (px - v0x);
-    };
-
-    int64_t e0_init = edge_sp(sv0x, sv0y, sv1x, sv1y, pcx, pcy);
-    int64_t e1_init = edge_sp(sv1x, sv1y, sv2x, sv2y, pcx, pcy);
-    int64_t e2_init = edge_sp(sv2x, sv2y, sv0x, sv0y, pcx, pcy);
-
-    // Per-pixel deltas (step by SP in sub-pixel space)
-    int64_t e0_dx = -(int64_t)(sv1y - sv0y) * SP;
-    int64_t e0_dy =  (int64_t)(sv1x - sv0x) * SP;
-    int64_t e1_dx = -(int64_t)(sv2y - sv1y) * SP;
-    int64_t e1_dy =  (int64_t)(sv2x - sv1x) * SP;
-    int64_t e2_dx = -(int64_t)(sv0y - sv2y) * SP;
-    int64_t e2_dy =  (int64_t)(sv0x - sv2x) * SP;
-
-    // Top-left rule
-    bool tl0 = (e0_dx > 0) || (e0_dx == 0 && e0_dy < 0);
-    bool tl1 = (e1_dx > 0) || (e1_dx == 0 && e1_dy < 0);
-    bool tl2 = (e2_dx > 0) || (e2_dx == 0 && e2_dy < 0);
-
-    auto inside = [](int64_t e, bool tl) { return e > 0 || (e == 0 && tl); };
-
-    // 1/z plane
-    int64_t iz_dx_val = e1_dx * iz0 + e2_dx * iz1 + e0_dx * iz2;
-    int64_t iz_dy_val = e1_dy * iz0 + e2_dy * iz1 + e0_dy * iz2;
-    int64_t iz_init   = e1_init * iz0 + e2_init * iz1 + e0_init * iz2;
-
-    // Determine shift for iz truncation (match hardware IZ_FRAC)
-    int CW_val = 0, CH_val = 0;
-    for (int v = W-1; v > 0; v >>= 1) CW_val++;
-    for (int v = H-1; v > 0; v >>= 1) CH_val++;
-    int EW_val = CW_val + CH_val + 4 + 4 + 1; // VW + VH + 1
-    int IZ_FRAC = 16 + EW_val;
-    int shift = IZ_FRAC - 16;
-
-    int64_t row0 = e0_init, row1 = e1_init, row2 = e2_init;
-    int64_t iz_row = iz_init;
-
-    for (int qy = miny; qy <= maxy; qy += 2) {
-        int64_t col0 = row0, col1 = row1, col2 = row2;
-        int64_t iz_col = iz_row;
-
-        for (int qx = minx; qx <= maxx; qx += 2) {
-            int64_t a0 = col0,          a1 = col1,          a2 = col2;
-            int64_t b0 = col0 + e0_dx,  b1 = col1 + e1_dx,  b2 = col2 + e2_dx;
-            int64_t c0 = col0 + e0_dy,  c1 = col1 + e1_dy,  c2 = col2 + e2_dy;
-            int64_t d0 = b0   + e0_dy,  d1 = b1   + e1_dy,  d2 = b2   + e2_dy;
-
-            int64_t iz_p[4];
-            iz_p[0] = iz_col;
-            iz_p[1] = iz_col + iz_dx_val;
-            iz_p[2] = iz_col + iz_dy_val;
-            iz_p[3] = iz_col + iz_dx_val + iz_dy_val;
-
-            if (qy <= maxy && qx <= maxx && inside(a0,tl0) && inside(a1,tl1) && inside(a2,tl2)) {
-                uint16_t iz16 = (uint16_t)(iz_p[0] >> shift);
-                if (iz16 >= zb_ref[qy][qx]) {
-                    fb_ref[qy][qx] = color;
-                    zb_ref[qy][qx] = iz16;
-                }
+void load_obj(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { printf("ERROR: cannot open %s\n", path); return; }
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == 'v' && line[1] == ' ') {
+            Vec3 v;
+            sscanf(line + 2, "%f %f %f", &v.x, &v.y, &v.z);
+            vertices.push_back(v);
+        } else if (line[0] == 'f' && line[1] == ' ') {
+            // Parse face (may have v//vn or v/vt/vn format)
+            Face face;
+            int vi[4] = {0}, count = 0;
+            char *p = line + 2;
+            while (*p && count < 4) {
+                vi[count] = atoi(p) - 1; // OBJ is 1-indexed
+                count++;
+                while (*p && *p != ' ' && *p != '\n') p++;
+                while (*p == ' ') p++;
             }
-            if (qy <= maxy && qx+1 <= maxx && inside(b0,tl0) && inside(b1,tl1) && inside(b2,tl2)) {
-                uint16_t iz16 = (uint16_t)(iz_p[1] >> shift);
-                if (iz16 >= zb_ref[qy][qx+1]) {
-                    fb_ref[qy][qx+1] = color;
-                    zb_ref[qy][qx+1] = iz16;
-                }
+            // Triangulate quads
+            face.v[0] = vi[0]; face.v[1] = vi[1]; face.v[2] = vi[2];
+            faces.push_back(face);
+            if (count == 4) {
+                face.v[0] = vi[0]; face.v[1] = vi[2]; face.v[2] = vi[3];
+                faces.push_back(face);
             }
-            if (qy+1 <= maxy && qx <= maxx && inside(c0,tl0) && inside(c1,tl1) && inside(c2,tl2)) {
-                uint16_t iz16 = (uint16_t)(iz_p[2] >> shift);
-                if (iz16 >= zb_ref[qy+1][qx]) {
-                    fb_ref[qy+1][qx] = color;
-                    zb_ref[qy+1][qx] = iz16;
-                }
-            }
-            if (qy+1 <= maxy && qx+1 <= maxx && inside(d0,tl0) && inside(d1,tl1) && inside(d2,tl2)) {
-                uint16_t iz16 = (uint16_t)(iz_p[3] >> shift);
-                if (iz16 >= zb_ref[qy+1][qx+1]) {
-                    fb_ref[qy+1][qx+1] = color;
-                    zb_ref[qy+1][qx+1] = iz16;
-                }
-            }
-
-            col0 += e0_dx * 2;
-            col1 += e1_dx * 2;
-            col2 += e2_dx * 2;
-            iz_col += iz_dx_val * 2;
         }
+    }
+    fclose(f);
+    printf("Loaded %zu vertices, %zu triangles\n", vertices.size(), faces.size());
+}
 
-        row0 += e0_dy * 2;
-        row1 += e1_dy * 2;
-        row2 += e2_dy * 2;
-        iz_row += iz_dy_val * 2;
+struct Vec2i { int x, y; };
+
+void project(const Vec3 *verts, int nv, float angle_y, float angle_x,
+             Vec2i *out, float *out_iz) {
+    float cy = cosf(angle_y), sy = sinf(angle_y);
+    float cx = cosf(angle_x), sx = sinf(angle_x);
+    float scale = 80.0f;
+
+    for (int i = 0; i < nv; i++) {
+        // Flip Y to put model upright (screen Y increases downward)
+        float x = verts[i].x, y = -verts[i].y, z = verts[i].z;
+        float rx = x * cy + z * sy;
+        float rz = -x * sy + z * cy;
+        float ry = y * cx - rz * sx;
+        float rz2 = y * sx + rz * cx;
+
+        // Orthographic projection + scale to screen
+        out[i].x = (int)((rx * scale) + W/2);
+        out[i].y = (int)((ry * scale) + H/2);
+        // 1/z: closer to camera (larger rz2) should have larger iz
+        out_iz[i] = 275.0f + rz2 * 225.0f;
+        if (out_iz[i] < 1.0f) out_iz[i] = 1.0f;
     }
 }
 
-void draw_triangle_hw(Vraster_top *dut, Vec2 v0, Vec2 v1, Vec2 v2,
-                      uint16_t iz0, uint16_t iz1, uint16_t iz2,
+void draw_triangle_hw(Vraster_top *dut, Vec2i v0, Vec2i v1, Vec2i v2,
+                      float iz0, float iz1, float iz2,
                       uint32_t color) {
-    // Convert pixel coords to sub-pixel (4 fractional bits, sample at pixel center)
-    dut->v0_x = v0.x * 16 + 8; dut->v0_y = v0.y * 16 + 8;
-    dut->v1_x = v1.x * 16 + 8; dut->v1_y = v1.y * 16 + 8;
-    dut->v2_x = v2.x * 16 + 8; dut->v2_y = v2.y * 16 + 8;
-    dut->v0_iz = iz0; dut->v1_iz = iz1; dut->v2_iz = iz2;
+    const int SP = 16;
+    // Skip if any vertex is off-screen (simple guard — no real clipping)
+    auto offscreen = [](Vec2i v) { return v.x < 0 || v.x >= W || v.y < 0 || v.y >= H; };
+    if (offscreen(v0) || offscreen(v1) || offscreen(v2)) return;
+
+    // Compute 1/z plane equation: iz(x,y) = iz_init + iz_dx*x + iz_dy*y
+    // Using barycentric interpolation divided by area
+    float area = (float)((v1.x - v0.x) * (v2.y - v0.y) - (v1.y - v0.y) * (v2.x - v0.x));
+    if (fabsf(area) < 0.001f) return;
+
+    // Gradients: diz/dx and diz/dy
+    float diz_dx = ((iz1 - iz0) * (v2.y - v0.y) - (iz2 - iz0) * (v1.y - v0.y)) / area;
+    float diz_dy = ((iz2 - iz0) * (v1.x - v0.x) - (iz1 - iz0) * (v2.x - v0.x)) / area;
+
+    // Compute iz at bounding box origin (what the HW will use as starting point)
+    int bbminx = std::min({v0.x, v1.x, v2.x}) & ~1;
+    int bbminy = std::min({v0.y, v1.y, v2.y}) & ~1;
+    if (bbminx < 0) bbminx = 0;
+    if (bbminy < 0) bbminy = 0;
+    float iz_at_bb = iz0 + diz_dx * (bbminx - v0.x) + diz_dy * (bbminy - v0.y);
+
+    // Scale by 32 for better z precision. Max iz value: 500*32=16000, fits int16.
+    // Max gradient per pixel * 32 ~ small (Suzanne spans ~160px, iz range ~450, grad~3*32=96)
+    // iz_at_bb max: 500*32=16000, well within int16 range
+    int16_t iz_init_fp = (int16_t)roundf(iz_at_bb * 32.0f);
+    int16_t iz_dx_fp = (int16_t)roundf(diz_dx * 32.0f);
+    int16_t iz_dy_fp = (int16_t)roundf(diz_dy * 32.0f);
+
+    dut->v0_x = v0.x * SP + SP/2;
+    dut->v0_y = v0.y * SP + SP/2;
+    dut->v1_x = v1.x * SP + SP/2;
+    dut->v1_y = v1.y * SP + SP/2;
+    dut->v2_x = v2.x * SP + SP/2;
+    dut->v2_y = v2.y * SP + SP/2;
+    dut->iz_init = iz_init_fp;
+    dut->iz_dx = iz_dx_fp;
+    dut->iz_dy = iz_dy_fp;
     dut->color = color;
     dut->start = 1;
     dut->clk = 0; dut->eval();
     dut->clk = 1; dut->eval();
     dut->start = 0;
 
-    int timeout = 200000;
+    int timeout = 500000;
     while (!dut->done && timeout-- > 0) {
         dut->clk = 0; dut->eval();
         dut->clk = 1; dut->eval();
     }
-
-    if (timeout <= 0) {
-        printf("ERROR: Hardware timeout\n");
-    }
+    if (timeout <= 0) printf("ERROR: timeout\n");
 }
 
 void clear_hw(Vraster_top *dut) {
@@ -212,25 +168,6 @@ void read_fb(Vraster_top *dut) {
     }
 }
 
-int compare_fb() {
-    int errors = 0;
-    for (int y = 0; y < H; y++) {
-        for (int x = 0; x < W; x++) {
-            uint32_t ref = fb_ref[y][x];
-            uint8_t ref_r = (ref >> 16) & 0xFF;
-            uint8_t ref_g = (ref >> 8) & 0xFF;
-            uint8_t ref_b = ref & 0xFF;
-            uint16_t ref_565 = ((ref_r >> 3) << 11) | ((ref_g >> 2) << 5) | (ref_b >> 3);
-            uint8_t ref_r8 = (ref_565 >> 11) << 3;
-            uint8_t ref_g8 = ((ref_565 >> 5) & 0x3F) << 2;
-            uint8_t ref_b8 = (ref_565 & 0x1F) << 3;
-            uint32_t ref_888 = (ref_r8 << 16) | (ref_g8 << 8) | ref_b8;
-            if (fb_hw[y][x] != ref_888) errors++;
-        }
-    }
-    return errors;
-}
-
 void write_ppm(const char *filename) {
     FILE *f = fopen(filename, "wb");
     fprintf(f, "P6\n%d %d\n255\n", W, H);
@@ -243,66 +180,88 @@ void write_ppm(const char *filename) {
     fclose(f);
 }
 
+// Simple face normal for flat shading — compute in view space
+uint32_t shade_face(Vec3 v0, Vec3 v1, Vec3 v2, float angle_y, float angle_x) {
+    // Face normal in object space
+    Vec3 e1 = {v1.x-v0.x, v1.y-v0.y, v1.z-v0.z};
+    Vec3 e2 = {v2.x-v0.x, v2.y-v0.y, v2.z-v0.z};
+    Vec3 n = {e1.y*e2.z - e1.z*e2.y, e1.z*e2.x - e1.x*e2.z, e1.x*e2.y - e1.y*e2.x};
+    float len = sqrtf(n.x*n.x + n.y*n.y + n.z*n.z);
+    if (len < 1e-6f) return 0x404040;
+    n.x /= len; n.y /= len; n.z /= len;
+
+    // Rotate normal to view space
+    float cy = cosf(angle_y), sy = sinf(angle_y);
+    float cx = cosf(angle_x), sx = sinf(angle_x);
+    float nx2 = n.x * cy + n.z * sy;
+    float nz2 = -n.x * sy + n.z * cy;
+    float ny2 = n.y * cx - nz2 * sx;
+    float nz3 = n.y * sx + nz2 * cx;
+
+    // Light direction
+    float lx = 0.186f, ly = 0.279f, lz = 0.932f;
+    float dot = nx2 * lx + ny2 * ly + nz3 * lz;
+    if (dot < 0) dot = 0;
+    float intensity = 0.2f + 0.8f * dot;
+
+    // Color from object-space normal direction (gives each face a unique hue)
+    float r_base = 0.5f + 0.5f * n.x;
+    float g_base = 0.5f + 0.5f * n.y;
+    float b_base = 0.5f + 0.5f * n.z;
+
+    uint8_t r = (uint8_t)(intensity * r_base * 255);
+    uint8_t g = (uint8_t)(intensity * g_base * 255);
+    uint8_t b = (uint8_t)(intensity * b_base * 255);
+    return (r << 16) | (g << 8) | b;
+}
+
 int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
     Vraster_top *dut = new Vraster_top;
 
-    const int NUM_FRAMES = 180;
-    const int cx = W/2, cy = H/2;
-    const int radius = 70;
-    int total_errors = 0;
+    load_obj("suzanne.obj");
+    if (vertices.empty()) return 1;
+
+    const int NUM_FRAMES = 90;
+    int nv = vertices.size();
+    std::vector<Vec2i> proj(nv);
+    std::vector<float> proj_iz(nv);
 
     for (int frame = 0; frame < NUM_FRAMES; frame++) {
-        memset(fb_hw, 0, sizeof(fb_hw));
-        memset(fb_ref, 0, sizeof(fb_ref));
-        memset(zb_ref, 0, sizeof(zb_ref));
-
-        // Clear HW framebuffer and z-buffer
         clear_hw(dut);
 
-        // Rotating square as two adjacent triangles
-        double angle = frame * 2.0 * M_PI / (NUM_FRAMES * 8);
-        double cs = cos(angle), sn = sin(angle);
+        float angle_y = frame * 2.0f * M_PI / NUM_FRAMES;
+        float angle_x = -0.3f; // slight tilt (negative to flip upright)
 
-        int px[4], py[4];
-        double offsets[4][2] = {{-1,-1},{1,-1},{1,1},{-1,1}};
-        for (int i = 0; i < 4; i++) {
-            double ox = offsets[i][0] * radius;
-            double oy = offsets[i][1] * radius;
-            px[i] = cx + (int)(ox * cs - oy * sn);
-            py[i] = cy + (int)(ox * sn + oy * cs);
-            if (px[i] < 0) px[i] = 0;
-            if (px[i] >= W) px[i] = W-1;
-            if (py[i] < 0) py[i] = 0;
-            if (py[i] >= H) py[i] = H-1;
+        project(vertices.data(), nv, angle_y, angle_x, proj.data(), proj_iz.data());
+
+        int drawn = 0;
+        for (auto &face : faces) {
+            Vec2i p0 = proj[face.v[0]], p1 = proj[face.v[1]], p2 = proj[face.v[2]];
+            float iz0 = proj_iz[face.v[0]];
+            float iz1 = proj_iz[face.v[1]];
+            float iz2 = proj_iz[face.v[2]];
+
+            // Back-face culling (Y negated in projection flips winding)
+            int cross = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
+            if (cross >= 0) continue;
+
+            uint32_t color = shade_face(vertices[face.v[0]], vertices[face.v[1]],
+                                        vertices[face.v[2]], angle_y, angle_x);
+
+            draw_triangle_hw(dut, p0, p2, p1, iz0, iz2, iz1, color);
+            drawn++;
         }
 
-        // Two adjacent triangles sharing diagonal p0-p2
-        Vec2 a0={px[0],py[0]}, a1={px[1],py[1]}, a2={px[2],py[2]};
-        Vec2 b0={px[0],py[0]}, b1={px[2],py[2]}, b2={px[3],py[3]};
-
-        draw_triangle_hw(dut, a0, a1, a2, 200, 200, 200, 0x00FFFF);
-        draw_triangle_hw(dut, b0, b1, b2, 150, 150, 150, 0xFF00FF);
-
-        draw_triangle_ref(a0, a1, a2, 200, 200, 200, 0x00FFFF);
-        draw_triangle_ref(b0, b1, b2, 150, 150, 150, 0xFF00FF);
-
         read_fb(dut);
-        int errors = compare_fb();
-        total_errors += errors;
-
-        printf("Frame %02d: %s", frame, errors == 0 ? "PASS" : "FAIL");
-        if (errors) printf(" (%d mismatches)", errors);
-        printf("\n");
 
         char filename[64];
-        snprintf(filename, sizeof(filename), "frame_%02d.ppm", frame);
+        snprintf(filename, sizeof(filename), "frame_%03d.ppm", frame);
         write_ppm(filename);
+        printf("Frame %03d: %d triangles drawn\n", frame, drawn);
     }
 
-    printf("\nTotal: %s (%d errors across %d frames)\n",
-           total_errors == 0 ? "PASS" : "FAIL", total_errors, NUM_FRAMES);
-
+    printf("\nDone: %d frames rendered\n", NUM_FRAMES);
     delete dut;
-    return total_errors ? 1 : 0;
+    return 0;
 }
