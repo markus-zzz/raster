@@ -56,8 +56,9 @@ module rasterizer #(
     // Bounding box (pixel coordinates)
     logic [CW-1:0] minx, maxx;
     logic [CH-1:0] miny, maxy;
-    logic [CW-1:0] qx;
-    logic [CH-1:0] qy;
+    // qx/qy widened by 1 bit to avoid wraparound when qy + 2 exceeds maxy near 2^CH
+    logic [CW:0] qx;
+    logic [CH:0] qy;
 
     // Edge function values (sub-pixel precision)
     logic signed [EW-1:0] e0_row, e1_row, e2_row;

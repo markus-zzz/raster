@@ -1,6 +1,9 @@
 #include <verilated.h>
 #include <verilated_fst_c.h>
-#include "Vgpu_top.h"
+#include "Vsystem_top.h"
+#include "Vsystem_top_system_top.h"
+#include "Vsystem_top_sdram_model.h"
+#include "Vsystem_top_gpu_top.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -13,19 +16,13 @@ static const int TW = 64, TH = 64;
 static const int NTX = (W + TW - 1) / TW;
 static const int NTY = (H + TH - 1) / TH;
 static const int NUM_TILES = NTX * NTY;
-static const int SP = 16; // 1 << SUBPIXEL
+static const int SP = 16;
 
-// Memory map (word addresses)
 static const int TRI_BASE     = 0x000000;
 static const int BIN_BASE     = 0x080000;
 static const int BINLIST_BASE = 0x081000;
 static const int FB_BASE      = 0x100000;
 
-// External memory model
-static const int MEM_SIZE = 0x200000; // 2M words
-static uint16_t ext_mem[MEM_SIZE];
-
-// Output framebuffer
 static uint32_t framebuffer[H][W];
 
 struct Vec3 { float x, y, z; };
@@ -95,68 +92,39 @@ uint32_t shade_face(Vec3 v0, Vec3 v1, Vec3 v2, float angle_y, float angle_x) {
     return (r<<16)|(g<<8)|b;
 }
 
-// Write triangle record to ext_mem at TRI_BASE + tri_id*16
-void write_tri_record(int tri_id, const Tri2D &t) {
+void write_tri_record(auto &mem, int tri_id, const Tri2D &t) {
     int base = TRI_BASE + tri_id * 16;
-    ext_mem[base+0] = (uint16_t)(t.p[0].x * SP + SP/2);
-    ext_mem[base+1] = (uint16_t)(t.p[0].y * SP + SP/2);
-    ext_mem[base+2] = (uint16_t)(t.p[1].x * SP + SP/2);
-    ext_mem[base+3] = (uint16_t)(t.p[1].y * SP + SP/2);
-    ext_mem[base+4] = (uint16_t)(t.p[2].x * SP + SP/2);
-    ext_mem[base+5] = (uint16_t)(t.p[2].y * SP + SP/2);
+    mem[base+0] = (uint16_t)(t.p[0].x * SP + SP/2);
+    mem[base+1] = (uint16_t)(t.p[0].y * SP + SP/2);
+    mem[base+2] = (uint16_t)(t.p[1].x * SP + SP/2);
+    mem[base+3] = (uint16_t)(t.p[1].y * SP + SP/2);
+    mem[base+4] = (uint16_t)(t.p[2].x * SP + SP/2);
+    mem[base+5] = (uint16_t)(t.p[2].y * SP + SP/2);
 
-    // Compute iz plane at the triangle's screen-space bbox origin
     float area = (float)((t.p[1].x-t.p[0].x)*(t.p[2].y-t.p[0].y) -
                          (t.p[1].y-t.p[0].y)*(t.p[2].x-t.p[0].x));
-    float diz_dx=0, diz_dy=0, iz_at_bb=t.iz[0];
+    float diz_dx=0, diz_dy=0;
     if (fabsf(area) > 0.001f) {
         diz_dx = ((t.iz[1]-t.iz[0])*(t.p[2].y-t.p[0].y) -
                   (t.iz[2]-t.iz[0])*(t.p[1].y-t.p[0].y)) / area;
         diz_dy = ((t.iz[2]-t.iz[0])*(t.p[1].x-t.p[0].x) -
                   (t.iz[1]-t.iz[0])*(t.p[2].x-t.p[0].x)) / area;
     }
-    // iz_init: value at the HW's clamped bbox origin for this tile
-    // Since the HW clamps per-tile, we store the plane coefficients and
-    // let the HW compute iz_init at its own bbox origin.
-    // Actually the HW loads iz_init directly — so we need to store it
-    // at the correct point. But we don't know which tile will use this triangle.
-    // Solution: store iz at vertex 0, plus gradients. The TB will compute
-    // iz_init per-tile when writing bin lists... but that requires per-tile
-    // per-triangle data which is expensive.
-    //
-    // Simpler: store diz_dx, diz_dy, and iz at (0,0) in screen space.
-    // The HW can compute iz_at_bbox = iz_at_00 + diz_dx * minx + diz_dy * miny.
-    // But that requires a multiply in HW which we removed...
-    //
-    // Simplest for now: store iz_init at the triangle's own bbox origin (unclamped).
-    // The HW's bbox is clamped to the tile, so there's a mismatch.
-    // We need the HW to step iz from the triangle's bbox to the tile's bbox.
-    // Since iz steps linearly, the HW can do:
-    //   iz_row = iz_init + iz_dx * (minx - tri_bbminx) + iz_dy * (miny - tri_bbminy)
-    // But that's again a multiply...
-    //
-    // OK, let's just store iz_init as iz at pixel (0,0) and have the HW
-    // do iz_row = iz_init + iz_dx * minx + iz_dy * miny using adds in a loop
-    // during SETUP. minx is at most 319, so 319 adds of iz_dx. That's too slow.
-    //
-    // Best approach: store iz_init at (0,0). The HW accumulates iz_dx * minx
-    // by shifting (minx is known). Actually just do the multiply — it's only
-    // 16-bit × 9-bit, one DSP, one cycle. Let's add that back to the HW.
-    //
-    // For now: store iz at (0,0) = iz0 - diz_dx*p0.x - diz_dy*p0.y
     float iz_at_00 = t.iz[0] - diz_dx*t.p[0].x - diz_dy*t.p[0].y;
 
-    ext_mem[base+6] = (uint16_t)(int16_t)roundf(iz_at_00 * 32.0f);
-    ext_mem[base+7] = (uint16_t)(int16_t)roundf(diz_dx * 32.0f);
-    ext_mem[base+8] = (uint16_t)(int16_t)roundf(diz_dy * 32.0f);
-    ext_mem[base+9] = (uint16_t)(t.color & 0xFFFF);       // {G, R}
-    ext_mem[base+10] = (uint16_t)((t.color >> 16) & 0xFF); // {0, B}
-    // 11-15 reserved
+    mem[base+6] = (uint16_t)(int16_t)roundf(iz_at_00 * 32.0f);
+    mem[base+7] = (uint16_t)(int16_t)roundf(diz_dx * 32.0f);
+    mem[base+8] = (uint16_t)(int16_t)roundf(diz_dy * 32.0f);
+    mem[base+9] = (uint16_t)(t.color & 0xFFFF);
+    mem[base+10] = (uint16_t)((t.color >> 16) & 0xFF);
 }
 
-// Prepare bin lists in ext_mem
-void prepare_bins(const std::vector<Tri2D> &tris) {
-    // Write bin pointer table and bin lists
+void prepare_bins(auto &mem, const std::vector<Tri2D> &tris) {
+    // Zero all bin pointers first
+    for (int tile = 0; tile < NUM_TILES; tile++) {
+        mem[BIN_BASE + tile*2]     = 0;
+        mem[BIN_BASE + tile*2 + 1] = 0;
+    }
     int list_offset = 0;
     for (int tile = 0; tile < NUM_TILES; tile++) {
         int tx = (tile % NTX) * TW;
@@ -169,12 +137,12 @@ void prepare_bins(const std::vector<Tri2D> &tris) {
             const auto &t = tris[i];
             if (t.bbmaxx < tx || t.bbminx > tile_xmax) continue;
             if (t.bbmaxy < ty || t.bbminy > tile_ymax) continue;
-            ext_mem[BINLIST_BASE + list_offset] = (uint16_t)i;
+            mem[BINLIST_BASE + list_offset] = (uint16_t)i;
             list_offset++;
         }
         int count = list_offset - start_offset;
-        ext_mem[BIN_BASE + tile*2]     = (uint16_t)start_offset;
-        ext_mem[BIN_BASE + tile*2 + 1] = (uint16_t)count;
+        mem[BIN_BASE + tile*2]     = (uint16_t)start_offset;
+        mem[BIN_BASE + tile*2 + 1] = (uint16_t)count;
     }
 }
 
@@ -192,8 +160,7 @@ void write_ppm(const char *fn) {
 
 int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
-    Verilated::traceEverOn(true);
-    Vgpu_top *dut = new Vgpu_top;
+    Vsystem_top *dut = new Vsystem_top;
 
     bool do_trace = false;
     for (int i = 1; i < argc; i++)
@@ -201,6 +168,7 @@ int main(int argc, char **argv) {
 
     VerilatedFstC *tfp = nullptr;
     if (do_trace) {
+        Verilated::traceEverOn(true);
         tfp = new VerilatedFstC;
         dut->trace(tfp, 99);
         tfp->open("gpu.fst");
@@ -212,6 +180,9 @@ int main(int argc, char **argv) {
 
     printf("Screen: %dx%d, Tile: %dx%d, Grid: %dx%d\n", W, H, TW, TH, NTX, NTY);
 
+    // Get pointer to SDRAM model memory (backdoor)
+    auto &sdram_mem = dut->system_top->sdram->mem;
+
     const int NUM_FRAMES = 90;
     std::vector<Vec2i> proj;
     std::vector<float> proj_iz;
@@ -222,6 +193,12 @@ int main(int argc, char **argv) {
     dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
     dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
     dut->rst = 0;
+
+    // Wait for SDRAM init (100us = 10000 cycles)
+    for (int i = 0; i < 11000; i++) {
+        dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+        dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+    }
 
     for (int frame = 0; frame < NUM_FRAMES; frame++) {
         float angle_y = frame * 2.0f * M_PI / NUM_FRAMES;
@@ -235,12 +212,11 @@ int main(int argc, char **argv) {
             Vec2i p0=proj[face.v[0]], p1=proj[face.v[1]], p2=proj[face.v[2]];
             int cross = (p1.x-p0.x)*(p2.y-p0.y) - (p1.y-p0.y)*(p2.x-p0.x);
             if (cross >= 0) continue;
-            // Skip if any vertex off-screen (unsigned port limitation)
             if (p0.x<0||p0.x>=W||p0.y<0||p0.y>=H) continue;
             if (p1.x<0||p1.x>=W||p1.y<0||p1.y>=H) continue;
             if (p2.x<0||p2.x>=W||p2.y<0||p2.y>=H) continue;
             Tri2D t;
-            t.p[0]=p0; t.p[1]=p2; t.p[2]=p1; // swap winding
+            t.p[0]=p0; t.p[1]=p2; t.p[2]=p1;
             t.iz[0]=proj_iz[face.v[0]]; t.iz[1]=proj_iz[face.v[2]]; t.iz[2]=proj_iz[face.v[1]];
             t.color = shade_face(vertices[face.v[0]], vertices[face.v[1]],
                                  vertices[face.v[2]], angle_y, angle_x);
@@ -251,15 +227,15 @@ int main(int argc, char **argv) {
             tris.push_back(t);
         }
 
-        // Write triangle records to ext_mem
+        // Write triangle records to SDRAM (backdoor)
         for (int i = 0; i < (int)tris.size(); i++)
-            write_tri_record(i, tris[i]);
+            write_tri_record(sdram_mem, i, tris[i]);
 
-        // Prepare bin lists
-        prepare_bins(tris);
+        // Prepare bin lists in SDRAM (backdoor)
+        prepare_bins(sdram_mem, tris);
 
-        // Clear FB region
-        memset(&ext_mem[FB_BASE], 0, W * H * sizeof(uint16_t));
+        // Clear FB region in SDRAM
+        for (int i = 0; i < W*H; i++) sdram_mem[FB_BASE + i] = 0;
 
         // Start GPU
         dut->start = 1;
@@ -268,45 +244,17 @@ int main(int argc, char **argv) {
         dut->start = 0;
 
         // Run until done
-        int timeout = 100000000;
-        uint16_t mem_rd_reg = 0;
-        bool rd_pending = false;
-        bool rd_valid_next = false;
-        uint16_t rd_data_next = 0;
+        int timeout = 10000000;
         while (!dut->done && timeout-- > 0) {
-            // Set memory interface inputs
-            dut->mem_ready = 1;
-            dut->mem_rd_valid = rd_valid_next;
-            dut->mem_rd_data = rd_data_next;
-            rd_valid_next = false;
-
-            // Eval to get combinational outputs (mem_req, mem_addr, etc.)
-            dut->clk = 0; dut->eval();
-            if (tfp) tfp->dump(sim_time); sim_time++;
-
-            // Sample requests
-            bool req = dut->mem_req;
-            bool we = dut->mem_we;
-            uint32_t addr = dut->mem_addr % MEM_SIZE;
-
-            if (req && we) {
-                ext_mem[addr] = dut->mem_wr_data;
-            }
-            if (req && !we) {
-                rd_data_next = ext_mem[addr];
-                rd_valid_next = true;
-            }
-
-            // Rising edge — FSM latches
-            dut->clk = 1; dut->eval();
-            if (tfp) tfp->dump(sim_time); sim_time++;
+            dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+            dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
         }
         if (timeout <= 0) { printf("Frame %03d: TIMEOUT\n", frame); break; }
 
-        // Read back framebuffer from ext_mem
+        // Read back framebuffer from SDRAM (backdoor)
         for (int y = 0; y < H; y++) {
             for (int x = 0; x < W; x++) {
-                uint16_t c = ext_mem[FB_BASE + y*W + x];
+                uint16_t c = sdram_mem[FB_BASE + y*W + x];
                 uint8_t r = (c >> 11) << 3;
                 uint8_t g = ((c >> 5) & 0x3F) << 2;
                 uint8_t b = (c & 0x1F) << 3;

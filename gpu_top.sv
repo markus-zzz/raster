@@ -14,11 +14,14 @@ module gpu_top #(
     input  logic rst,
     input  logic start,
     output logic done,
-    // External memory (16-bit, 1-cycle read latency)
+    // External memory handshake interface
     output logic [MEM_AW-1:0] mem_addr,
+    output logic              mem_req,
     output logic              mem_we,
     output logic [15:0]       mem_wr_data,
-    input  logic [15:0]       mem_rd_data
+    input  logic [15:0]       mem_rd_data,
+    input  logic              mem_rd_valid,
+    input  logic              mem_ready
 );
 
     localparam NTX = (WIDTH + TILE_W - 1) / TILE_W;
@@ -31,39 +34,18 @@ module gpu_top #(
     localparam VW = CW + SUBPIXEL;
     localparam VH = CH + SUBPIXEL;
 
-    // Tile index and coordinates
+    // Tile coordinates
     logic [$clog2(NUM_TILES)-1:0] tile_idx;
     logic [CW-1:0] tile_x;
     logic [CH-1:0] tile_y;
-
-    // Compute tile_x/tile_y from tile_idx (registered for timing)
-    always_ff @(posedge clk) begin
-        if (rst) begin
-            tile_x <= 0;
-            tile_y <= 0;
-        end else if (state == S_IDLE && start) begin
-            tile_x <= 0;
-            tile_y <= 0;
-        end else if (state == S_NEXT_TILE) begin
-            if (tile_x + CW'(TILE_W) >= CW'(WIDTH)) begin
-                tile_x <= 0;
-                tile_y <= tile_y + CH'(TILE_H);
-            end else begin
-                tile_x <= tile_x + CW'(TILE_W);
-            end
-        end
-    end
 
     // FSM
     typedef enum logic [3:0] {
         S_IDLE,
         S_LOAD_BIN_OFFSET,
-        S_LOAD_BIN_OFFSET_W,
         S_LOAD_BIN_COUNT,
-        S_LOAD_BIN_COUNT_W,
         S_CLEAR,
         S_FETCH_TRI_IDX,
-        S_FETCH_TRI_IDX_W,
         S_FETCH_TRI,
         S_RASTERIZE,
         S_DUMP_RD,
@@ -97,8 +79,6 @@ module gpu_top #(
 
     // Dump pixel counter
     logic [$clog2(TILE_PIX)-1:0] dump_pix;
-
-    // Dump pixel coordinates (tile-local)
     logic [$clog2(TILE_W)-1:0] dump_x;
     logic [$clog2(TILE_H)-1:0] dump_y;
     assign dump_x = dump_pix[$clog2(TILE_W)-1:0];
@@ -111,20 +91,38 @@ module gpu_top #(
                           + (ADDR_WIDTH+2)'({dump_y[0], dump_x[0]});
     end
 
-    // Memory address/write mux
+    // Request tracking: only issue mem_req once per read, then wait for rd_valid
+    logic req_sent;
+
+    // Memory address/request generation
     always_comb begin
         mem_addr = '0;
+        mem_req = 0;
         mem_we = 0;
         mem_wr_data = '0;
+
         case (state)
-            S_LOAD_BIN_OFFSET: mem_addr = BIN_BASE[MEM_AW-1:0] + (MEM_AW'(tile_idx) << 1);
-            S_LOAD_BIN_COUNT:  mem_addr = BIN_BASE[MEM_AW-1:0] + (MEM_AW'(tile_idx) << 1) + 1;
-            S_FETCH_TRI_IDX:   mem_addr = BINLIST_BASE[MEM_AW-1:0] + bin_offset + MEM_AW'(tri_n);
-            S_FETCH_TRI:       mem_addr = TRI_BASE[MEM_AW-1:0] + (MEM_AW'(tri_id) << 4) + MEM_AW'(tri_word);
+            S_LOAD_BIN_OFFSET: begin
+                mem_addr = BIN_BASE[MEM_AW-1:0] + (MEM_AW'(tile_idx) << 1);
+                mem_req = mem_ready && !req_sent;
+            end
+            S_LOAD_BIN_COUNT: begin
+                mem_addr = BIN_BASE[MEM_AW-1:0] + (MEM_AW'(tile_idx) << 1) + 1;
+                mem_req = mem_ready && !req_sent;
+            end
+            S_FETCH_TRI_IDX: begin
+                mem_addr = BINLIST_BASE[MEM_AW-1:0] + bin_offset + MEM_AW'(tri_n);
+                mem_req = mem_ready && !req_sent;
+            end
+            S_FETCH_TRI: begin
+                mem_addr = TRI_BASE[MEM_AW-1:0] + (MEM_AW'(tri_id) << 4) + MEM_AW'(tri_word);
+                mem_req = mem_ready && !req_sent;
+            end
             S_DUMP_WR: begin
                 mem_addr = FB_BASE[MEM_AW-1:0]
                          + MEM_AW'(tile_y + CH'(dump_y)) * MEM_AW'(WIDTH)
                          + MEM_AW'(tile_x + CW'(dump_x));
+                mem_req = mem_ready && !req_sent;
                 mem_we = 1;
                 mem_wr_data = fb_rd_data;
             end
@@ -138,56 +136,74 @@ module gpu_top #(
             state <= S_IDLE;
             done <= 0;
             tile_idx <= 0;
+            tile_x <= 0;
+            tile_y <= 0;
             rast_clear <= 0;
             rast_start <= 0;
+            req_sent <= 0;
         end else begin
             rast_clear <= 0;
             rast_start <= 0;
+
+            // Track whether we've issued a request in the current state
+            if (mem_req && mem_ready)
+                req_sent <= 1;
 
             case (state)
                 S_IDLE: begin
                     done <= 0;
                     if (start) begin
                         tile_idx <= 0;
+                        tile_x <= 0;
+                        tile_y <= 0;
+                        req_sent <= 0;
                         state <= S_LOAD_BIN_OFFSET;
                     end
                 end
 
-                S_LOAD_BIN_OFFSET: state <= S_LOAD_BIN_OFFSET_W;
-                S_LOAD_BIN_OFFSET_W: begin
-                    bin_offset <= MEM_AW'(mem_rd_data);
-                    state <= S_LOAD_BIN_COUNT;
+                S_LOAD_BIN_OFFSET: begin
+                    if (mem_rd_valid) begin
+                        bin_offset <= MEM_AW'(mem_rd_data);
+                        req_sent <= 0;
+                        state <= S_LOAD_BIN_COUNT;
+                    end
                 end
-                S_LOAD_BIN_COUNT: state <= S_LOAD_BIN_COUNT_W;
-                S_LOAD_BIN_COUNT_W: begin
-                    bin_count <= mem_rd_data;
-                    tri_n <= 0;
-                    rast_clear <= 1;
-                    state <= S_CLEAR;
+
+                S_LOAD_BIN_COUNT: begin
+                    if (mem_rd_valid) begin
+                        bin_count <= mem_rd_data;
+                        tri_n <= 0;
+                        rast_clear <= 1;
+                        req_sent <= 0;
+                        state <= S_CLEAR;
+                    end
                 end
 
                 S_CLEAR: begin
                     if (rast_clear_done) begin
                         if (bin_count == 0) begin
                             dump_pix <= 0;
+                            req_sent <= 0;
                             state <= S_DUMP_RD;
                         end else begin
+                            req_sent <= 0;
                             state <= S_FETCH_TRI_IDX;
                         end
                     end
                 end
 
-                S_FETCH_TRI_IDX: state <= S_FETCH_TRI_IDX_W;
-                S_FETCH_TRI_IDX_W: begin
-                    tri_id <= mem_rd_data;
-                    tri_word <= 0;
-                    state <= S_FETCH_TRI;
+                S_FETCH_TRI_IDX: begin
+                    if (mem_rd_valid) begin
+                        tri_id <= mem_rd_data;
+                        tri_word <= 0;
+                        req_sent <= 0;
+                        state <= S_FETCH_TRI;
+                    end
                 end
 
                 S_FETCH_TRI: begin
-                    // Capture data from previous cycle's address
-                    if (tri_word > 0) begin
-                        case (tri_word - 4'd1)
+                    if (mem_rd_valid) begin
+                        case (tri_word)
                             4'd0:  v0_x_r <= mem_rd_data[VW-1:0];
                             4'd1:  v0_y_r <= mem_rd_data[VH-1:0];
                             4'd2:  v1_x_r <= mem_rd_data[VW-1:0];
@@ -201,18 +217,21 @@ module gpu_top #(
                             4'd10: color_r[23:16] <= mem_rd_data[7:0];
                             default: ;
                         endcase
-                    end
-                    if (tri_word == 4'd11) begin
-                        rast_start <= 1;
-                        state <= S_RASTERIZE;
-                    end else begin
-                        tri_word <= tri_word + 1;
+                        if (tri_word == 4'd10) begin
+                            rast_start <= 1;
+                            req_sent <= 0;
+                            state <= S_RASTERIZE;
+                        end else begin
+                            tri_word <= tri_word + 1;
+                            req_sent <= 0;  // allow next word fetch
+                        end
                     end
                 end
 
                 S_RASTERIZE: begin
                     if (rast_done) begin
                         tri_n <= tri_n + 1;
+                        req_sent <= 0;
                         if (tri_n + 1 >= bin_count) begin
                             dump_pix <= 0;
                             state <= S_DUMP_RD;
@@ -222,20 +241,33 @@ module gpu_top #(
                     end
                 end
 
-                // Dump: 2 cycles per pixel (read FB, then write to ext mem)
-                S_DUMP_RD: state <= S_DUMP_WR;  // present read addr, wait 1 cycle
+                S_DUMP_RD: begin
+                    // BRAM read latency: 1 cycle
+                    state <= S_DUMP_WR;
+                end
+
                 S_DUMP_WR: begin
-                    // fb_rd_data is valid now; mem_we writes it
-                    if (dump_pix == $clog2(TILE_PIX)'(TILE_PIX - 1)) begin
-                        state <= S_NEXT_TILE;
-                    end else begin
-                        dump_pix <= dump_pix + 1;
-                        state <= S_DUMP_RD;
+                    // Write accepted when mem_req && mem_ready (req_sent goes high)
+                    if (req_sent) begin
+                        req_sent <= 0;
+                        if (dump_pix == $clog2(TILE_PIX)'(TILE_PIX - 1)) begin
+                            state <= S_NEXT_TILE;
+                        end else begin
+                            dump_pix <= dump_pix + 1;
+                            state <= S_DUMP_RD;
+                        end
                     end
                 end
 
                 S_NEXT_TILE: begin
                     tile_idx <= tile_idx + 1;
+                    if (tile_x + CW'(TILE_W) >= CW'(WIDTH)) begin
+                        tile_x <= 0;
+                        tile_y <= tile_y + CH'(TILE_H);
+                    end else begin
+                        tile_x <= tile_x + CW'(TILE_W);
+                    end
+                    req_sent <= 0;
                     if (tile_idx + 1 >= $clog2(NUM_TILES)'(NUM_TILES)) begin
                         state <= S_DONE;
                     end else begin
