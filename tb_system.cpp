@@ -234,9 +234,6 @@ int main(int argc, char **argv) {
         // Prepare bin lists in SDRAM (backdoor)
         prepare_bins(sdram_mem, tris);
 
-        // Clear FB region in SDRAM
-        for (int i = 0; i < W*H; i++) sdram_mem[FB_BASE + i] = 0;
-
         // Start GPU
         dut->start = 1;
         dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
