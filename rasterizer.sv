@@ -366,7 +366,7 @@ module rasterizer #(
             zb_wr_addr <= p2_addr;
             zb_wr_data <= p2_iz;
             for (int i = 0; i < 4; i++) begin
-                fb_mask[i] <= p2_inside[i] && (p2_iz[i] >= zb_rd_data[i]);
+                fb_mask[i] <= p2_inside[i] && (p2_iz[i] >= zb_rd_data[i]); // more clear if if/else that covers both
                 zb_wr_mask[i] <= p2_inside[i] && (p2_iz[i] >= zb_rd_data[i]);
             end
         end else begin

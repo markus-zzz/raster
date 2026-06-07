@@ -1,19 +1,20 @@
 module gpu_top #(
-    parameter WIDTH       = 320,
-    parameter HEIGHT      = 200,
-    parameter TILE_W      = 64,
-    parameter TILE_H      = 64,
-    parameter SUBPIXEL    = 4,
-    parameter MEM_AW      = 24,
-    parameter TRI_BASE     = 0,
-    parameter BIN_BASE     = 24'h08_0000,
-    parameter BINLIST_BASE = 24'h08_1000,
-    parameter FB_BASE      = 24'h10_0000
+    parameter FRAME_W      = 320,
+    parameter FRAME_H      = 200,
+    parameter TILE_W       = 64,
+    parameter TILE_H       = 64,
+    parameter SUBPIXEL     = 4,
+    parameter MEM_AW       = 24,
+    parameter TRI_BASE          = 0,
+    parameter BIN_BASE          = 24'h08_0000,
+    parameter BINLIST_BASE      = 24'h08_1000,
+    parameter MAX_FACES_PER_TILE = 1024,
+    parameter FB_BASE           = 24'h10_0000
 ) (
     input  logic clk,
     input  logic rst,
-    input  logic start,
-    output logic done,
+    input  logic start, // frame_start
+    output logic done,  // frame_done
     // External memory handshake interface
     output logic [MEM_AW-1:0] mem_addr,
     output logic              mem_req,
@@ -24,13 +25,13 @@ module gpu_top #(
     input  logic              mem_ready
 );
 
-    localparam NTX = (WIDTH + TILE_W - 1) / TILE_W;
-    localparam NTY = (HEIGHT + TILE_H - 1) / TILE_H;
+    localparam NTX = (FRAME_W + TILE_W - 1) / TILE_W;
+    localparam NTY = (FRAME_H + TILE_H - 1) / TILE_H;
     localparam NUM_TILES = NTX * NTY;
     localparam TILE_PIX = TILE_W * TILE_H;
     localparam ADDR_WIDTH = $clog2((TILE_W/2) * (TILE_H/2));
-    localparam CW = $clog2(WIDTH);
-    localparam CH = $clog2(HEIGHT);
+    localparam CW = $clog2(FRAME_W);
+    localparam CH = $clog2(FRAME_H);
     localparam VW = CW + SUBPIXEL;
     localparam VH = CH + SUBPIXEL;
 
@@ -42,7 +43,6 @@ module gpu_top #(
     // FSM
     typedef enum logic [3:0] {
         S_IDLE,
-        S_LOAD_BIN_OFFSET,
         S_LOAD_BIN_COUNT,
         S_CLEAR,
         S_FETCH_TRI_IDX,
@@ -57,7 +57,6 @@ module gpu_top #(
     state_t state;
 
     // Bin info
-    logic [MEM_AW-1:0] bin_offset;
     logic [15:0]       bin_count;
     logic [15:0]       tri_n;
 
@@ -102,16 +101,14 @@ module gpu_top #(
         mem_wr_data = '0;
 
         case (state)
-            S_LOAD_BIN_OFFSET: begin
-                mem_addr = BIN_BASE[MEM_AW-1:0] + (MEM_AW'(tile_idx) << 1);
-                mem_req = mem_ready && !req_sent;
-            end
             S_LOAD_BIN_COUNT: begin
-                mem_addr = BIN_BASE[MEM_AW-1:0] + (MEM_AW'(tile_idx) << 1) + 1;
+                mem_addr = BIN_BASE[MEM_AW-1:0] + MEM_AW'(tile_idx);
                 mem_req = mem_ready && !req_sent;
             end
             S_FETCH_TRI_IDX: begin
-                mem_addr = BINLIST_BASE[MEM_AW-1:0] + bin_offset + MEM_AW'(tri_n);
+                mem_addr = BINLIST_BASE[MEM_AW-1:0]
+                         + MEM_AW'(tile_idx) * MEM_AW'(MAX_FACES_PER_TILE)
+                         + MEM_AW'(tri_n);
                 mem_req = mem_ready && !req_sent;
             end
             S_FETCH_TRI: begin
@@ -120,7 +117,7 @@ module gpu_top #(
             end
             S_DUMP_WR: begin
                 mem_addr = FB_BASE[MEM_AW-1:0]
-                         + MEM_AW'(tile_y + CH'(dump_y)) * MEM_AW'(WIDTH)
+                         + MEM_AW'(tile_y + CH'(dump_y)) * MEM_AW'(FRAME_W)
                          + MEM_AW'(tile_x + CW'(dump_x));
                 mem_req = mem_ready && !req_sent;
                 mem_we = 1;
@@ -156,14 +153,6 @@ module gpu_top #(
                         tile_idx <= 0;
                         tile_x <= 0;
                         tile_y <= 0;
-                        req_sent <= 0;
-                        state <= S_LOAD_BIN_OFFSET;
-                    end
-                end
-
-                S_LOAD_BIN_OFFSET: begin
-                    if (mem_rd_valid) begin
-                        bin_offset <= MEM_AW'(mem_rd_data);
                         req_sent <= 0;
                         state <= S_LOAD_BIN_COUNT;
                     end
@@ -261,7 +250,7 @@ module gpu_top #(
 
                 S_NEXT_TILE: begin
                     tile_idx <= tile_idx + 1;
-                    if (tile_x + CW'(TILE_W) >= CW'(WIDTH)) begin
+                    if (tile_x + CW'(TILE_W) >= CW'(FRAME_W)) begin
                         tile_x <= 0;
                         tile_y <= tile_y + CH'(TILE_H);
                     end else begin
@@ -271,7 +260,7 @@ module gpu_top #(
                     if (tile_idx + 1 >= $clog2(NUM_TILES)'(NUM_TILES)) begin
                         state <= S_DONE;
                     end else begin
-                        state <= S_LOAD_BIN_OFFSET;
+                        state <= S_LOAD_BIN_COUNT;
                     end
                 end
 
@@ -287,8 +276,8 @@ module gpu_top #(
 
     // Raster top instance
     raster_top #(
-        .WIDTH(WIDTH),
-        .HEIGHT(HEIGHT),
+        .FRAME_W(FRAME_W),
+        .FRAME_H(FRAME_H),
         .TILE_W(TILE_W),
         .TILE_H(TILE_H),
         .SUBPIXEL(SUBPIXEL)

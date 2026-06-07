@@ -1,8 +1,8 @@
 module raster_top #(
-    parameter WIDTH = 320,
-    parameter HEIGHT = 200,
-    parameter TILE_W = 64,
-    parameter TILE_H = 64,
+    parameter FRAME_W  = 320,
+    parameter FRAME_H  = 200,
+    parameter TILE_W   = 64,
+    parameter TILE_H   = 64,
     parameter SUBPIXEL = 4,
     parameter ADDR_WIDTH = $clog2((TILE_W/2) * (TILE_H/2))
 ) (
@@ -12,12 +12,12 @@ module raster_top #(
     input  logic clear,
     output logic clear_done,
     // Tile offset
-    input  logic [$clog2(WIDTH)-1:0] tile_x,
-    input  logic [$clog2(HEIGHT)-1:0] tile_y,
+    input  logic [$clog2(FRAME_W)-1:0] tile_x,
+    input  logic [$clog2(FRAME_H)-1:0] tile_y,
     // Triangle input (sub-pixel fixed-point, screen-space)
     input  logic start,
-    input  logic [$clog2(WIDTH)+SUBPIXEL-1:0] v0_x, v1_x, v2_x,
-    input  logic [$clog2(HEIGHT)+SUBPIXEL-1:0] v0_y, v1_y, v2_y,
+    input  logic [$clog2(FRAME_W)+SUBPIXEL-1:0] v0_x, v1_x, v2_x,
+    input  logic [$clog2(FRAME_H)+SUBPIXEL-1:0] v0_y, v1_y, v2_y,
     input  logic signed [15:0] iz_init, iz_dx, iz_dy,
     input  logic [23:0] color,
     output logic done,
@@ -63,8 +63,8 @@ module raster_top #(
     logic [15:0]            fb_rd_data_bank[4];
 
     rasterizer #(
-        .RES_W(WIDTH),
-        .RES_H(HEIGHT),
+        .RES_W(FRAME_W),
+        .RES_H(FRAME_H),
         .TILE_W(TILE_W),
         .TILE_H(TILE_H),
         .SUBPIXEL(SUBPIXEL),
@@ -99,9 +99,9 @@ module raster_top #(
     logic [3:0]            zb_wr_mask;
     logic [15:0]           zb_wr_data;
 
+    // Put directly into ports to make consistent
     assign fb_wr_addr = clearing ? clear_addr : rast_fb_addr;
     assign fb_wr_mask = clearing ? 4'b1111 : rast_fb_mask;
-    assign fb_wr_data = clearing ? 16'h0 : 16'h0; // unused, per-bank below
     assign zb_wr_addr = clearing ? clear_addr : rast_zb_wr_addr;
     assign zb_wr_mask = clearing ? 4'b1111 : rast_zb_wr_mask;
 

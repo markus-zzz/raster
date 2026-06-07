@@ -2,8 +2,8 @@
 // TB uses backdoor access to sdram_model.mem[] for pre-loading and readback
 
 module system_top #(
-    parameter WIDTH     = 320,
-    parameter HEIGHT    = 200,
+    parameter FRAME_W   = 320,
+    parameter FRAME_H   = 200,
     parameter TILE_W    = 64,
     parameter TILE_H    = 64,
     parameter SUBPIXEL  = 4,
@@ -45,8 +45,8 @@ module system_top #(
     wire [15:0] sdram_dq_to_model = sdram_dq_ctrl_out;
 
     gpu_top #(
-        .WIDTH(WIDTH),
-        .HEIGHT(HEIGHT),
+        .FRAME_W(FRAME_W),
+        .FRAME_H(FRAME_H),
         .TILE_W(TILE_W),
         .TILE_H(TILE_H),
         .SUBPIXEL(SUBPIXEL),
