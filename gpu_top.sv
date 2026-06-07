@@ -5,11 +5,16 @@ module gpu_top #(
     parameter TILE_H       = 64,
     parameter SUBPIXEL     = 4,
     parameter MEM_AW       = 24,
-    parameter TRI_BASE          = 0,
-    parameter BIN_BASE          = 24'h08_0000,
-    parameter BINLIST_BASE      = 24'h08_1000,
+    // Compact memory map fits in 256 KB:
+    //   TRI_BASE     0x00000
+    //   BIN_BASE     0x04000
+    //   BINLIST_BASE 0x05000  (tile T at +T*MAX_FACES_PER_TILE)
+    //   FB_BASE      0x0A000
+    parameter TRI_BASE          = 24'h00_0000,
+    parameter BIN_BASE          = 24'h00_4000,
+    parameter BINLIST_BASE      = 24'h00_5000,
     parameter MAX_FACES_PER_TILE = 1024,
-    parameter FB_BASE           = 24'h10_0000
+    parameter FB_BASE           = 24'h00_A000
 ) (
     input  logic clk,
     input  logic rst,

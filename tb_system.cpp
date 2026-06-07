@@ -2,8 +2,16 @@
 #include <verilated_fst_c.h>
 #include "Vsystem_top.h"
 #include "Vsystem_top_system_top.h"
-#include "Vsystem_top_sdram_model.h"
 #include "Vsystem_top_gpu_top.h"
+#ifdef SDRAM_INIT_MODE
+// Non-default SDRAM_INIT_FILE parameter gives the parameterized modules an
+// "__Iz1" name suffix.
+#include "Vsystem_top_sdram_model__Iz1.h"
+#include "Vsystem_top_dpram__DB20000_Iz1.h"
+#else
+#include "Vsystem_top_sdram_model.h"
+#include "Vsystem_top_dpram__DB20000.h"
+#endif
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -24,15 +32,23 @@ static const int NTY = (H + TH - 1) / TH;
 static const int NUM_TILES = NTX * NTY;
 static const int SP = 16;
 
-static const int TRI_BASE     = 0x000000;
-static const int BIN_BASE     = 0x080000;
-static const int BINLIST_BASE = 0x081000;
-static const int FB_BASE      = 0x100000;
+// SDRAM memory map (halfword units). Total used: ~157 KB, fits in 256 KB.
+//   TRI_BASE     0x00000  (1024 tris max * 16 hw)
+//   BIN_BASE     0x04000  (per-tile counts)
+//   BINLIST_BASE 0x05000  (NUM_TILES * MAX_FACES_PER_TILE = 0x5000 hw)
+//   FB_BASE      0x0A000  (FRAME_W * FRAME_H = 0xFA00 hw)
+static const int TRI_BASE     = 0x00000;
+static const int BIN_BASE     = 0x04000;
+static const int BINLIST_BASE = 0x05000;
+static const int FB_BASE      = 0x0A000;
 
 // Each tile gets a fixed-address bucket of MAX_FACES_PER_TILE entries in the
 // binlist region. Tile T's bucket starts at BINLIST_BASE + T*MAX_FACES_PER_TILE
 // (halfword units). A power of 2 makes the indexing trivial in HW.
 static const int MAX_FACES_PER_TILE = 1024;
+
+// Total SDRAM model storage in 16-bit words (must match sdram_model ADDR_BITS).
+static const int SDRAM_WORDS = 1 << 17;  // 128 K words = 256 KB
 
 static uint32_t framebuffer[H][W];
 
@@ -226,6 +242,17 @@ void finalize_bins(auto &mem) {
     }
 }
 
+// Dump the entire SDRAM contents as a flat $readmemh hex file (one 16-bit word
+// per line, in address order). Loadable directly into the SDRAM model's BRAM
+// via $readmemh on real HW. Small enough (128 K words) to dump in full.
+void dump_sdram_hex(const char *fn, const auto &mem) {
+    FILE *f = fopen(fn, "w");
+    if (!f) { printf("ERROR: cannot open %s for write\n", fn); return; }
+    for (int i = 0; i < SDRAM_WORDS; i++)
+        fprintf(f, "%04X\n", mem[i]);
+    fclose(f);
+}
+
 void write_ppm(const char *fn) {
     FILE *f = fopen(fn, "wb");
     fprintf(f, "P6\n%d %d\n255\n", W, H);
@@ -261,12 +288,14 @@ int main(int argc, char **argv) {
     printf("Screen: %dx%d, Tile: %dx%d, Grid: %dx%d\n", W, H, TW, TH, NTX, NTY);
 
     // Backdoor pointer to SDRAM model memory
-    auto &sdram_mem = dut->system_top->sdram->mem;
+    auto &sdram_mem = dut->system_top->sdram->mem_inst->mem;
 
     const int NUM_FRAMES = 90;
 
     // Reset
     dut->rst = 1;
+    dut->display_enable = 0;
+    dut->display_frame_start = 0;
     dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
     dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
     dut->rst = 0;
@@ -277,11 +306,16 @@ int main(int argc, char **argv) {
         dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
     }
 
+    // Turn on the mocked display controller after SDRAM is initialized.
+    // It will continuously read the FB and apply bus pressure.
+    dut->display_enable = 1;
+
     for (int frame = 0; frame < NUM_FRAMES; frame++) {
         float angle_y = frame * 2.0f * (float)M_PI / NUM_FRAMES;
         float angle_x = -0.3f;
         glm::mat3 R = build_view_rot(angle_y, angle_x);
 
+#ifndef SDRAM_INIT_MODE
         // Process each face end-to-end (transform -> normal -> cull -> light
         // -> project -> bbox -> bin -> tri record), one triangle at a time.
         // Models the streaming dataflow of a HW geometry pipeline.
@@ -297,6 +331,17 @@ int main(int argc, char **argv) {
 
         // Flush per-tile (offset, count) table the GPU reads.
         finalize_bins(sdram_mem);
+
+        // Dump the prepared geometry for the first frame as a hex preload file
+        // (for moving to real HW; loadable via $readmemh into the SDRAM BRAM).
+        if (frame == 0)
+            dump_sdram_hex("sdram_init.hex", sdram_mem);
+#else
+        // Geometry is preloaded once via $readmemh (SDRAM_INIT_FILE). We do not
+        // repopulate it, so every frame renders the same preloaded image.
+        (void)R;
+        int tri_id = 0;
+#endif
 
         // Clear FB region in SDRAM
         for (int i = 0; i < W * H; i++) sdram_mem[FB_BASE + i] = 0;
@@ -314,16 +359,52 @@ int main(int argc, char **argv) {
         }
         if (timeout <= 0) { printf("Frame %03d: TIMEOUT\n", frame); break; }
 
-        // Read back framebuffer from SDRAM (backdoor)
-        for (int y = 0; y < H; y++) {
-            for (int x = 0; x < W; x++) {
-                uint16_t c = sdram_mem[FB_BASE + y * W + x];
+        // Capture the framebuffer through the display controller.
+        // 1. Disable the display so it stops issuing new reads.
+        // 2. Wait until the SDRAM bus is idle (no in-flight requests). This
+        //    guarantees all GPU writes have committed and all display reads
+        //    have returned.
+        // 3. Pulse frame_start so the display restarts at FB_BASE+0 with a
+        //    clean FIFO state.
+        // 4. Re-enable the display and collect 320*200 pixels from the
+        //    pix_valid stream.
+        dut->display_enable = 0;
+
+        int idle_streak = 0;
+        int idle_timeout = 10000;
+        while (idle_streak < 16 && idle_timeout-- > 0) {
+            dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+            dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+            idle_streak = dut->sdram_idle ? idle_streak + 1 : 0;
+        }
+        if (idle_timeout <= 0)
+            printf("Frame %03d: SDRAM never went idle\n", frame);
+
+        dut->display_frame_start = 1;
+        dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+        dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+        dut->display_frame_start = 0;
+        dut->display_enable = 1;
+
+        int captured = 0;
+        int cap_timeout = W * H * 16;
+        while (captured < W * H && cap_timeout-- > 0) {
+            dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+            dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+            if (dut->display_pix_valid) {
+                uint16_t c = dut->display_pix_data;
+                int y = captured / W;
+                int x = captured % W;
                 uint8_t r = (c >> 11) << 3;
                 uint8_t g = ((c >> 5) & 0x3F) << 2;
                 uint8_t b = (c & 0x1F) << 3;
                 framebuffer[y][x] = (r << 16) | (g << 8) | b;
+                captured++;
             }
         }
+        if (cap_timeout <= 0)
+            printf("Frame %03d: display capture timeout (got %d/%d)\n",
+                   frame, captured, W * H);
 
         char fn[64];
         snprintf(fn, sizeof(fn), "frame_%03d.ppm", frame);
