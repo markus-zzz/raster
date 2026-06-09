@@ -1,3 +1,5 @@
+`default_nettype none
+
 module raster_top #(
     parameter FRAME_W  = 320,
     parameter FRAME_H  = 200,
@@ -6,23 +8,23 @@ module raster_top #(
     parameter SUBPIXEL = 4,
     parameter ADDR_WIDTH = $clog2((TILE_W/2) * (TILE_H/2))
 ) (
-    input  logic clk,
-    input  logic rst,
+    input  wire  clk,
+    input  wire  rst,
     // Tile clear
-    input  logic clear,
+    input  wire  clear,
     output logic clear_done,
     // Tile offset
-    input  logic [$clog2(FRAME_W)-1:0] tile_x,
-    input  logic [$clog2(FRAME_H)-1:0] tile_y,
+    input  wire  [$clog2(FRAME_W)-1:0] tile_x,
+    input  wire  [$clog2(FRAME_H)-1:0] tile_y,
     // Triangle input (sub-pixel fixed-point, screen-space)
-    input  logic start,
-    input  logic [$clog2(FRAME_W)+SUBPIXEL-1:0] v0_x, v1_x, v2_x,
-    input  logic [$clog2(FRAME_H)+SUBPIXEL-1:0] v0_y, v1_y, v2_y,
-    input  logic signed [15:0] iz_init, iz_dx, iz_dy,
-    input  logic [23:0] color,
+    input  wire  start,
+    input  wire  [$clog2(FRAME_W)+SUBPIXEL-1:0] v0_x, v1_x, v2_x,
+    input  wire  [$clog2(FRAME_H)+SUBPIXEL-1:0] v0_y, v1_y, v2_y,
+    input  wire  signed [15:0] iz_init, iz_dx, iz_dy,
+    input  wire  [23:0] color,
     output logic done,
     // Framebuffer read port (tile-local)
-    input  logic [ADDR_WIDTH+1:0] fb_rd_pixel_addr,
+    input  wire  [ADDR_WIDTH+1:0] fb_rd_pixel_addr,
     output logic [15:0] fb_rd_data
 );
 
@@ -142,6 +144,14 @@ module raster_top #(
         end
     endgenerate
 
-    assign fb_rd_data = fb_rd_data_bank[fb_rd_pixel_addr[1:0]];
+    // The dpram read data is registered (1-cycle latency). The bank-select must
+    // be delayed by the same amount so the correct bank is muxed when the data
+    // arrives. (With a held address this is a no-op; with a per-cycle changing
+    // address, e.g. burst dump read-out, it keeps select aligned to the data.)
+    logic [1:0] fb_rd_bank_sel_q;
+    always_ff @(posedge clk)
+        fb_rd_bank_sel_q <= fb_rd_pixel_addr[1:0];
+
+    assign fb_rd_data = fb_rd_data_bank[fb_rd_bank_sel_q];
 
 endmodule

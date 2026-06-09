@@ -1,3 +1,5 @@
+`default_nettype none
+
 // System top: gpu_top + display_ctrl -> arbiter -> sdram_ctrl -> sdram_model
 // TB uses backdoor access to sdram_model.mem_inst.mem[] for pre-loading
 // and readback.
@@ -11,14 +13,15 @@ module system_top #(
     parameter MEM_AW    = 24,
     parameter SDRAM_INIT_FILE = ""   // optional $readmemh preload of SDRAM
 ) (
-    input  logic clk,
-    input  logic rst,
+    input  wire clk,
+    input  wire rst,
     // GPU control
-    input  logic start,
+    input  wire start,
     output logic done,
     // Display controller enable (TB toggles this to apply bus load)
-    input  logic display_enable,
-    input  logic display_frame_start,
+    input  wire display_enable,
+    input  wire display_frame_start,
+    input  wire display_pix_ce,
     output logic [15:0] display_pix_data,
     output logic        display_pix_valid,
     // SDRAM bus ready (high while controller is idle, no requests in flight,
@@ -32,6 +35,7 @@ module system_top #(
     logic              gpu_req;
     logic              gpu_we;
     logic [15:0]       gpu_wr_data;
+    logic              gpu_wr_data_req;
     logic [15:0]       gpu_rd_data;
     logic              gpu_rd_valid;
     logic              gpu_ready;
@@ -41,6 +45,7 @@ module system_top #(
     logic              disp_req;
     logic              disp_we;
     logic [15:0]       disp_wr_data;
+    logic              disp_wr_data_req;
     logic [15:0]       disp_rd_data;
     logic              disp_rd_valid;
     logic              disp_ready;
@@ -50,6 +55,7 @@ module system_top #(
     logic              mem_req;
     logic              mem_we;
     logic [15:0]       mem_wr_data;
+    logic              mem_wr_data_req;
     logic [15:0]       mem_rd_data;
     logic              mem_rd_valid;
     logic              mem_ready;
@@ -89,6 +95,7 @@ module system_top #(
         .mem_req(gpu_req),
         .mem_we(gpu_we),
         .mem_wr_data(gpu_wr_data),
+        .mem_wr_data_req(gpu_wr_data_req),
         .mem_rd_data(gpu_rd_data),
         .mem_rd_valid(gpu_rd_valid),
         .mem_ready(gpu_ready)
@@ -102,6 +109,7 @@ module system_top #(
         .clk(clk),
         .rst(rst),
         .enable(display_enable),
+        .pix_ce(display_pix_ce),
         .frame_start(display_frame_start),
         .mem_addr(disp_addr),
         .mem_req(disp_req),
@@ -124,6 +132,7 @@ module system_top #(
         .m0_req(gpu_req),
         .m0_we(gpu_we),
         .m0_wr_data(gpu_wr_data),
+        .m0_wr_data_req(gpu_wr_data_req),
         .m0_rd_data(gpu_rd_data),
         .m0_rd_valid(gpu_rd_valid),
         .m0_ready(gpu_ready),
@@ -132,6 +141,7 @@ module system_top #(
         .m1_req(disp_req),
         .m1_we(disp_we),
         .m1_wr_data(disp_wr_data),
+        .m1_wr_data_req(disp_wr_data_req),
         .m1_rd_data(disp_rd_data),
         .m1_rd_valid(disp_rd_valid),
         .m1_ready(disp_ready),
@@ -140,6 +150,7 @@ module system_top #(
         .s_req(mem_req),
         .s_we(mem_we),
         .s_wr_data(mem_wr_data),
+        .s_wr_data_req(mem_wr_data_req),
         .s_rd_data(mem_rd_data),
         .s_rd_valid(mem_rd_valid),
         .s_ready(mem_ready)
@@ -157,6 +168,7 @@ module system_top #(
         .req(mem_req),
         .we(mem_we),
         .wr_data(mem_wr_data),
+        .wr_data_req(mem_wr_data_req),
         .rd_data(mem_rd_data),
         .rd_valid(mem_rd_valid),
         .ready(mem_ready),

@@ -1,3 +1,5 @@
+`default_nettype none
+
 module gpu_top #(
     parameter FRAME_W      = 320,
     parameter FRAME_H      = 200,
@@ -16,20 +18,22 @@ module gpu_top #(
     parameter MAX_FACES_PER_TILE = 1024,
     parameter FB_BASE           = 24'h00_A000
 ) (
-    input  logic clk,
-    input  logic rst,
-    input  logic start, // frame_start
+    input  wire  clk,
+    input  wire  rst,
+    input  wire  start, // frame_start
     output logic done,  // frame_done
     // External memory handshake interface
     output logic [MEM_AW-1:0] mem_addr,
     output logic              mem_req,
     output logic              mem_we,
     output logic [15:0]       mem_wr_data,
-    input  logic [15:0]       mem_rd_data,
-    input  logic              mem_rd_valid,
-    input  logic              mem_ready
+    input  wire               mem_wr_data_req,
+    input  wire  [15:0]       mem_rd_data,
+    input  wire               mem_rd_valid,
+    input  wire               mem_ready
 );
 
+    localparam BURST = 8;
     localparam NTX = (FRAME_W + TILE_W - 1) / TILE_W;
     localparam NTY = (FRAME_H + TILE_H - 1) / TILE_H;
     localparam NUM_TILES = NTX * NTY;
@@ -52,8 +56,8 @@ module gpu_top #(
         S_CLEAR,
         S_FETCH_TRI_IDX,
         S_FETCH_TRI,
+        S_FETCH_TRI2,
         S_RASTERIZE,
-        S_DUMP_RD,
         S_DUMP_WR,
         S_NEXT_TILE,
         S_DONE
@@ -67,7 +71,6 @@ module gpu_top #(
 
     // Triangle fetch
     logic [15:0] tri_id;
-    logic [3:0]  tri_word;
 
     // Triangle registers
     logic [VW-1:0] v0_x_r, v1_x_r, v2_x_r;
@@ -81,56 +84,102 @@ module gpu_top #(
     logic [ADDR_WIDTH+1:0] fb_rd_pixel_addr;
     logic [15:0] fb_rd_data;
 
-    // Dump pixel counter
+    // Dump pixel counter (group base, advances by BURST per write burst).
     logic [$clog2(TILE_PIX)-1:0] dump_pix;
-    logic [$clog2(TILE_W)-1:0] dump_x;
-    logic [$clog2(TILE_H)-1:0] dump_y;
-    assign dump_x = dump_pix[$clog2(TILE_W)-1:0];
-    assign dump_y = dump_pix[$clog2(TILE_PIX)-1:$clog2(TILE_W)];
 
-    // FB read address for dump
+    localparam PIXW = $clog2(TILE_PIX);
+    localparam TWB  = $clog2(TILE_W);
+    localparam BSEL = $clog2(BURST);
+
+    // During a dump write-burst the tile-BRAM read index leads the controller's
+    // data latch by one cycle: wptr is the beat whose address is presented now;
+    // its (registered) data is latched by the controller next cycle. wptr
+    // advances on each mem_wr_data_req.
+    logic [BSEL-1:0] wptr;
+    logic [PIXW-1:0] ridx;
+    assign ridx = dump_pix + PIXW'(wptr);
+    wire [TWB-1:0]        rx = ridx[TWB-1:0];
+    wire [PIXW-TWB-1:0]   ry = ridx[PIXW-1:TWB];
+
+    // FB read address for dump (tile-internal swizzled 2x2 layout)
     always_comb begin
-        fb_rd_pixel_addr = ((ADDR_WIDTH+2)'(dump_y >> 1) * (TILE_W/2)
-                          + (ADDR_WIDTH+2)'(dump_x >> 1)) * 4
-                          + (ADDR_WIDTH+2)'({dump_y[0], dump_x[0]});
+        fb_rd_pixel_addr = ((ADDR_WIDTH+2)'(ry >> 1) * (TILE_W/2)
+                          + (ADDR_WIDTH+2)'(rx >> 1)) * 4
+                          + (ADDR_WIDTH+2)'({ry[0], rx[0]});
     end
 
-    // Request tracking: only issue mem_req once per read, then wait for rd_valid
-    logic req_sent;
+    // Group base coordinates for the FB write burst address.
+    wire [TWB-1:0]      dump_x = dump_pix[TWB-1:0];
+    wire [PIXW-TWB-1:0] dump_y = dump_pix[PIXW-1:TWB];
 
-    // Memory address/request generation
-    always_comb begin
-        mem_addr = '0;
-        mem_req = 0;
-        mem_we = 0;
-        mem_wr_data = '0;
+    //=====================================================================
+    // Generic burst engine. The main FSM presents an 8-aligned address and a
+    // direction, pulses burst_go, and waits for burst_ack. Reads land in
+    // rdbuf[]; writes stream directly from the tile BRAM (mem_wr_data =
+    // fb_rd_data), with wptr selecting the beat.
+    //=====================================================================
+    typedef enum logic [1:0] { M_IDLE, M_REQ, M_RD, M_WR } mstate_t;
+    mstate_t mstate;
+    logic [MEM_AW-1:0] burst_addr;
+    logic              burst_we;
+    logic              burst_go;
+    logic              burst_ack;
+    logic [15:0]       rdbuf [0:BURST-1];
+    logic [BSEL-1:0]   beat;
 
-        case (state)
-            S_LOAD_BIN_COUNT: begin
-                mem_addr = BIN_BASE[MEM_AW-1:0] + MEM_AW'(tile_idx);
-                mem_req = mem_ready && !req_sent;
-            end
-            S_FETCH_TRI_IDX: begin
-                mem_addr = BINLIST_BASE[MEM_AW-1:0]
-                         + MEM_AW'(tile_idx) * MEM_AW'(MAX_FACES_PER_TILE)
-                         + MEM_AW'(tri_n);
-                mem_req = mem_ready && !req_sent;
-            end
-            S_FETCH_TRI: begin
-                mem_addr = TRI_BASE[MEM_AW-1:0] + (MEM_AW'(tri_id) << 4) + MEM_AW'(tri_word);
-                mem_req = mem_ready && !req_sent;
-            end
-            S_DUMP_WR: begin
-                mem_addr = FB_BASE[MEM_AW-1:0]
-                         + MEM_AW'(tile_y + CH'(dump_y)) * MEM_AW'(FRAME_W)
-                         + MEM_AW'(tile_x + CW'(dump_x));
-                mem_req = mem_ready && !req_sent;
-                mem_we = 1;
-                mem_wr_data = fb_rd_data;
-            end
-            default: ;
-        endcase
+    assign mem_addr    = burst_addr;
+    assign mem_we      = burst_we;
+    assign mem_req     = (mstate == M_REQ);
+    assign mem_wr_data = fb_rd_data;   // streamed directly from tile BRAM
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            mstate    <= M_IDLE;
+            burst_ack <= 0;
+            beat      <= 0;
+            wptr      <= 0;
+        end else begin
+            burst_ack <= 0;
+            // Advance the dump read pointer each time the controller consumes a
+            // write beat (leads the data latch by one cycle).
+            if (mstate == M_WR && mem_wr_data_req)
+                wptr <= wptr + 1'b1;
+            case (mstate)
+                M_IDLE: if (burst_go) begin
+                    beat   <= 0;
+                    wptr   <= 0;
+                    mstate <= M_REQ;
+                end
+                M_REQ: if (mem_ready) begin
+                    beat   <= 0;
+                    mstate <= burst_we ? M_WR : M_RD;
+                end
+                M_RD: if (mem_rd_valid) begin
+                    rdbuf[beat] <= mem_rd_data;
+                    if (beat == BSEL'(BURST-1)) begin
+                        burst_ack <= 1;
+                        mstate    <= M_IDLE;
+                    end else
+                        beat <= beat + 1'b1;
+                end
+                M_WR: if (mem_wr_data_req) begin
+                    if (beat == BSEL'(BURST-1)) begin
+                        burst_ack <= 1;
+                        mstate    <= M_IDLE;
+                    end else
+                        beat <= beat + 1'b1;
+                end
+                default: mstate <= M_IDLE;
+            endcase
+        end
     end
+
+    // Unaligned single-word accesses: read the aligned 8-word block and select.
+    wire [MEM_AW-1:0] bin_full  = BIN_BASE[MEM_AW-1:0] + MEM_AW'(tile_idx);
+    wire [MEM_AW-1:0] tidx_full = BINLIST_BASE[MEM_AW-1:0]
+                                + MEM_AW'(tile_idx) * MEM_AW'(MAX_FACES_PER_TILE)
+                                + MEM_AW'(tri_n);
+    logic [BSEL-1:0] sel_off;  // word offset within the burst block
 
     // FSM logic
     always_ff @(posedge clk) begin
@@ -142,14 +191,11 @@ module gpu_top #(
             tile_y <= 0;
             rast_clear <= 0;
             rast_start <= 0;
-            req_sent <= 0;
+            burst_go <= 0;
         end else begin
             rast_clear <= 0;
             rast_start <= 0;
-
-            // Track whether we've issued a request in the current state
-            if (mem_req && mem_ready)
-                req_sent <= 1;
+            burst_go <= 0;
 
             case (state)
                 S_IDLE: begin
@@ -158,17 +204,21 @@ module gpu_top #(
                         tile_idx <= 0;
                         tile_x <= 0;
                         tile_y <= 0;
-                        req_sent <= 0;
                         state <= S_LOAD_BIN_COUNT;
                     end
                 end
 
+                // Read the 8-word block containing the bin count and select it.
                 S_LOAD_BIN_COUNT: begin
-                    if (mem_rd_valid) begin
-                        bin_count <= mem_rd_data;
+                    if (mstate == M_IDLE && !burst_go && !burst_ack) begin
+                        burst_addr <= {bin_full[MEM_AW-1:BSEL], {BSEL{1'b0}}};
+                        burst_we   <= 1'b0;
+                        sel_off    <= bin_full[BSEL-1:0];
+                        burst_go   <= 1'b1;
+                    end else if (burst_ack) begin
+                        bin_count <= rdbuf[sel_off];
                         tri_n <= 0;
                         rast_clear <= 1;
-                        req_sent <= 0;
                         state <= S_CLEAR;
                     end
                 end
@@ -177,78 +227,90 @@ module gpu_top #(
                     if (rast_clear_done) begin
                         if (bin_count == 0) begin
                             dump_pix <= 0;
-                            req_sent <= 0;
-                            state <= S_DUMP_RD;
+                            state <= S_DUMP_WR;
                         end else begin
-                            req_sent <= 0;
                             state <= S_FETCH_TRI_IDX;
                         end
                     end
                 end
 
+                // Read the 8-word block containing the triangle index.
                 S_FETCH_TRI_IDX: begin
-                    if (mem_rd_valid) begin
-                        tri_id <= mem_rd_data;
-                        tri_word <= 0;
-                        req_sent <= 0;
-                        state <= S_FETCH_TRI;
+                    if (mstate == M_IDLE && !burst_go && !burst_ack) begin
+                        burst_addr <= {tidx_full[MEM_AW-1:BSEL], {BSEL{1'b0}}};
+                        burst_we   <= 1'b0;
+                        sel_off    <= tidx_full[BSEL-1:0];
+                        burst_go   <= 1'b1;
+                    end else if (burst_ack) begin
+                        tri_id <= rdbuf[sel_off];
+                        state  <= S_FETCH_TRI;
                     end
                 end
 
+                // Triangle record is 16 words = one 8-aligned burst (low 11
+                // words used). tri_id*16 is 8-aligned.
                 S_FETCH_TRI: begin
-                    if (mem_rd_valid) begin
-                        case (tri_word)
-                            4'd0:  v0_x_r <= mem_rd_data[VW-1:0];
-                            4'd1:  v0_y_r <= mem_rd_data[VH-1:0];
-                            4'd2:  v1_x_r <= mem_rd_data[VW-1:0];
-                            4'd3:  v1_y_r <= mem_rd_data[VH-1:0];
-                            4'd4:  v2_x_r <= mem_rd_data[VW-1:0];
-                            4'd5:  v2_y_r <= mem_rd_data[VH-1:0];
-                            4'd6:  iz_init_r <= $signed(mem_rd_data);
-                            4'd7:  iz_dx_r <= $signed(mem_rd_data);
-                            4'd8:  iz_dy_r <= $signed(mem_rd_data);
-                            4'd9:  color_r[15:0] <= mem_rd_data;
-                            4'd10: color_r[23:16] <= mem_rd_data[7:0];
-                            default: ;
-                        endcase
-                        if (tri_word == 4'd10) begin
-                            rast_start <= 1;
-                            req_sent <= 0;
-                            state <= S_RASTERIZE;
-                        end else begin
-                            tri_word <= tri_word + 1;
-                            req_sent <= 0;  // allow next word fetch
-                        end
+                    if (mstate == M_IDLE && !burst_go && !burst_ack) begin
+                        burst_addr <= TRI_BASE[MEM_AW-1:0] + (MEM_AW'(tri_id) << 4);
+                        burst_we   <= 1'b0;
+                        burst_go   <= 1'b1;
+                    end else if (burst_ack) begin
+                        // Words 0..7 are in rdbuf; 8..10 need a second burst.
+                        v0_x_r <= rdbuf[0][VW-1:0];
+                        v0_y_r <= rdbuf[1][VH-1:0];
+                        v1_x_r <= rdbuf[2][VW-1:0];
+                        v1_y_r <= rdbuf[3][VH-1:0];
+                        v2_x_r <= rdbuf[4][VW-1:0];
+                        v2_y_r <= rdbuf[5][VH-1:0];
+                        iz_init_r <= $signed(rdbuf[6]);
+                        iz_dx_r   <= $signed(rdbuf[7]);
+                        state <= S_FETCH_TRI2;
+                    end
+                end
+
+                S_FETCH_TRI2: begin
+                    if (mstate == M_IDLE && !burst_go && !burst_ack) begin
+                        burst_addr <= TRI_BASE[MEM_AW-1:0] + (MEM_AW'(tri_id) << 4) + MEM_AW'(BURST);
+                        burst_we   <= 1'b0;
+                        burst_go   <= 1'b1;
+                    end else if (burst_ack) begin
+                        iz_dy_r       <= $signed(rdbuf[0]);  // word 8
+                        color_r[15:0] <= rdbuf[1];           // word 9
+                        color_r[23:16]<= rdbuf[2][7:0];      // word 10
+                        rast_start <= 1;
+                        state <= S_RASTERIZE;
                     end
                 end
 
                 S_RASTERIZE: begin
                     if (rast_done) begin
                         tri_n <= tri_n + 1;
-                        req_sent <= 0;
                         if (tri_n + 1 >= bin_count) begin
                             dump_pix <= 0;
-                            state <= S_DUMP_RD;
+                            state <= S_DUMP_WR;
                         end else begin
                             state <= S_FETCH_TRI_IDX;
                         end
                     end
                 end
 
-                S_DUMP_RD: begin
-                    // BRAM read latency: 1 cycle
-                    state <= S_DUMP_WR;
-                end
-
+                // Stream BURST tile pixels directly from the raster BRAM to the
+                // SDRAM write port. The burst engine's wptr presents the read
+                // address one cycle ahead of the controller's data latch, so no
+                // prefetch buffer is needed.
                 S_DUMP_WR: begin
-                    // Write accepted when mem_req && mem_ready (req_sent goes high)
-                    if (req_sent) begin
-                        req_sent <= 0;
-                        if (dump_pix == $clog2(TILE_PIX)'(TILE_PIX - 1)) begin
+                    if (mstate == M_IDLE && !burst_go && !burst_ack) begin
+                        burst_addr <= FB_BASE[MEM_AW-1:0]
+                                    + MEM_AW'(tile_y + CH'(dump_y)) * MEM_AW'(FRAME_W)
+                                    + MEM_AW'(tile_x + CW'(dump_x));
+                        burst_we   <= 1'b1;
+                        burst_go   <= 1'b1;
+                    end else if (burst_ack) begin
+                        if (dump_pix >= PIXW'(TILE_PIX - BURST)) begin
                             state <= S_NEXT_TILE;
                         end else begin
-                            dump_pix <= dump_pix + 1;
-                            state <= S_DUMP_RD;
+                            dump_pix <= dump_pix + PIXW'(BURST);
+                            state    <= S_DUMP_WR;
                         end
                     end
                 end
@@ -261,7 +323,6 @@ module gpu_top #(
                     end else begin
                         tile_x <= tile_x + CW'(TILE_W);
                     end
-                    req_sent <= 0;
                     if (tile_idx + 1 >= $clog2(NUM_TILES)'(NUM_TILES)) begin
                         state <= S_DONE;
                     end else begin

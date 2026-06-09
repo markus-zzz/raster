@@ -1,16 +1,18 @@
+`default_nettype none
+
 module dpram #(
     parameter ADDR_WIDTH = 17,
     parameter DATA_WIDTH = 16,
     parameter DEPTH = 76800,
     parameter INIT_FILE = ""     // optional $readmemh preload
 ) (
-    input  logic clk,
+    input  wire  clk,
     // Write port
-    input  logic                    wr_en,
-    input  logic [ADDR_WIDTH-1:0]   wr_addr,
-    input  logic [DATA_WIDTH-1:0]   wr_data,
+    input  wire                     wr_en,
+    input  wire  [ADDR_WIDTH-1:0]   wr_addr,
+    input  wire  [DATA_WIDTH-1:0]   wr_data,
     // Read port
-    input  logic [ADDR_WIDTH-1:0]   rd_addr,
+    input  wire  [ADDR_WIDTH-1:0]   rd_addr,
     output logic [DATA_WIDTH-1:0]   rd_data
 );
     

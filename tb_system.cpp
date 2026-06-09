@@ -296,6 +296,9 @@ int main(int argc, char **argv) {
     dut->rst = 1;
     dut->display_enable = 0;
     dut->display_frame_start = 0;
+    // Drive the display pixel clock-enable at full rate in this standalone
+    // testbench (verified correct; the FIFO produces the same stream).
+    dut->display_pix_ce = 1;
     dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
     dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
     dut->rst = 0;

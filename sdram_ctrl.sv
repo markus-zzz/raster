@@ -1,7 +1,13 @@
+`default_nettype none
+
 // SDR SDRAM Controller for W9825G6KH-6
 // 16Mx16, 4 banks, 13-bit row, 9-bit column, CAS=2, 100 MHz
 //
-// Simple interface: address, read/write request, data in/out, ready
+// Burst interface: every access transfers BURST_LEN (=8) words.
+//   Read : one `req` (we=0) -> BURST_LEN `rd_valid`+`rd_data` beats.
+//   Write: one `req` (we=1) -> BURST_LEN `wr_data_req` pulses; the master
+//          presents the corresponding word on `wr_data` each pulse.
+// `addr` is the burst base address (must be BURST_LEN-aligned).
 // Address mapping: {bank[1:0], row[12:0], col[8:0]} = 24 bits = 16M words
 
 module sdram_ctrl #(
@@ -11,6 +17,7 @@ module sdram_ctrl #(
     parameter BANK_BITS   = 2,
     parameter DATA_BITS   = 16,
     parameter CAS_LATENCY = 2,
+    parameter BURST_LEN   = 8,   // fixed burst length (words per access)
     // Timing in clock cycles (for 100 MHz)
     parameter tRP         = 2,   // precharge to activate
     parameter tRCD        = 2,   // activate to read/write
@@ -18,16 +25,18 @@ module sdram_ctrl #(
     parameter tMRD        = 2,   // mode register set
     parameter REFRESH_INTERVAL = 780  // 7.8us / 10ns
 ) (
-    input  logic clk,
-    input  logic rst,
+    input  wire  clk,
+    input  wire  rst,
 
-    // User interface
-    input  logic [ROW_BITS+COL_BITS+BANK_BITS-1:0] addr,  // {bank, row, col}
-    input  logic                  req,       // request strobe
-    input  logic                  we,        // 1=write, 0=read
-    input  logic [DATA_BITS-1:0]  wr_data,
+    // User interface. Every access transfers BURST_LEN words. `addr` is the
+    // burst base address (must be BURST_LEN-aligned).
+    input  wire  [ROW_BITS+COL_BITS+BANK_BITS-1:0] addr,  // {bank, row, col}
+    input  wire                   req,       // request strobe
+    input  wire                   we,        // 1=write, 0=read
+    input  wire  [DATA_BITS-1:0]  wr_data,   // streamed write data (see wr_data_req)
+    output logic                  wr_data_req, // pulses each beat the controller consumes wr_data
     output logic [DATA_BITS-1:0]  rd_data,
-    output logic                  rd_valid,
+    output logic                  rd_valid,  // pulses each returned read beat
     output logic                  ready,     // combinational: can accept new request
 
     // SDRAM pins
@@ -42,8 +51,10 @@ module sdram_ctrl #(
     output logic                  sdram_dqm,
     output logic [DATA_BITS-1:0]  sdram_dq_out,
     output logic                  sdram_dq_oe,
-    input  logic [DATA_BITS-1:0]  sdram_dq_in
+    input  wire  [DATA_BITS-1:0]  sdram_dq_in
 );
+
+    localparam BEAT_BITS = $clog2(BURST_LEN+1);
 
     // SDRAM commands: {CS_N, RAS_N, CAS_N, WE_N}
     localparam CMD_NOP       = 4'b0111;
@@ -64,7 +75,10 @@ module sdram_ctrl #(
         S_IDLE,
         S_ACTIVATE,
         S_READ,
+        S_READ_BURST,
         S_WRITE,
+        S_WRITE_CMD,
+        S_WRITE_BURST,
         S_PRECHARGE,
         S_REFRESH
     } state_t;
@@ -74,10 +88,22 @@ module sdram_ctrl #(
     logic [3:0]  wait_counter;
     logic [9:0]  refresh_counter;
 
+    // Read pipeline: CAS_LATENCY + 2 cycles total (1 for our READ->model, 1 for
+    // model->our DQ_in). For a burst we inject BURST_LEN consecutive markers.
+    logic [CAS_LATENCY+1:0] rd_pipe;
+    logic [BEAT_BITS-1:0]   rd_inject;  // read beats still to inject
+    logic [BEAT_BITS-1:0]   wr_beat;    // write beats still to drive
+
+    // Burst busy: high from accept until the access fully completes. Blocks new
+    // requests so each burst owns the bus end to end.
+    logic busy;
+
     // ready is combinational: high when controller can accept a new request
     assign ready = (state == S_IDLE)
+                && !busy
                 && (wait_counter == 0)
                 && !(|rd_pipe)
+                && (rd_inject == 0)
                 && (refresh_counter < REFRESH_INTERVAL);
 
     // Command output
@@ -112,10 +138,14 @@ module sdram_ctrl #(
     logic [ROW_BITS-1:0]  lat_row;
     logic [COL_BITS-1:0]  lat_col;
     logic                  lat_we;
-    logic [DATA_BITS-1:0]  lat_wr_data;
 
-    // Read pipeline: CAS_LATENCY + 2 cycles total (1 for our READ→model, 1 for model→our DQ_in)
-    logic [CAS_LATENCY+1:0] rd_pipe;
+    // wr_data_req leads the dq_out latch by one cycle so a master whose data
+    // source has 1-cycle (registered) latency can stream directly without a
+    // prefetch buffer. The master advances its read address on each
+    // wr_data_req; the controller latches the resulting data the next cycle.
+    assign wr_data_req = (state == S_WRITE && wait_counter == 0)
+                      || (state == S_WRITE_CMD)
+                      || (state == S_WRITE_BURST && wr_beat > 1);
 
     always_ff @(posedge clk) begin
         if (rst) begin
@@ -128,13 +158,18 @@ module sdram_ctrl #(
             dq_oe <= 0;
             row_open <= 0;
             rd_pipe <= 0;
+            rd_inject <= 0;
+            wr_beat <= 0;
+            busy <= 0;
         end else begin
             cmd <= CMD_NOP;
             rd_valid <= 0;
             dq_oe <= 0;
 
-            // Read data pipeline
-            rd_pipe <= {rd_pipe[CAS_LATENCY:0], 1'b0};
+            // Read data pipeline: a marker reaching the end produces a rd_valid.
+            rd_pipe <= {rd_pipe[CAS_LATENCY:0], (rd_inject != 0) ? 1'b1 : 1'b0};
+            if (rd_inject != 0)
+                rd_inject <= rd_inject - 1'b1;
             if (rd_pipe[CAS_LATENCY+1]) begin
                 rd_data <= sdram_dq_in;
                 rd_valid <= 1;
@@ -185,8 +220,9 @@ module sdram_ctrl #(
                     end else begin
                         cmd <= CMD_MRS;
                         sdram_ba <= 0;
-                        // Mode register: burst=1, sequential, CAS=2, standard
-                        sdram_addr <= 13'b000_0_10_0_000_0_000;
+                        // Mode register: burst length 8, sequential, CAS=2.
+                        // [2:0]=011 (BL=8), [3]=0 seq, [6:4]=CAS=010
+                        sdram_addr <= 13'b000_0_010_0_011;
                         wait_counter <= tMRD;
                         state <= S_IDLE;
                     end
@@ -195,7 +231,7 @@ module sdram_ctrl #(
                 S_IDLE: begin
                     if (wait_counter > 0) begin
                         wait_counter <= wait_counter - 1;
-                    end else if (refresh_counter >= REFRESH_INTERVAL && !(|rd_pipe)) begin
+                    end else if (refresh_counter >= REFRESH_INTERVAL && !(|rd_pipe) && rd_inject == 0) begin
                         // Refresh: only when no outstanding read in flight
                         cmd <= CMD_PRECHARGE;
                         sdram_addr[10] <= 1'b1;
@@ -208,7 +244,7 @@ module sdram_ctrl #(
                         lat_row <= req_row;
                         lat_col <= req_col;
                         lat_we <= we;
-                        lat_wr_data <= wr_data;
+                        busy <= 1'b1;
 
                         if (row_open[req_bank] && open_row[req_bank] == req_row) begin
                             // Row hit: go directly to read/write
@@ -246,10 +282,23 @@ module sdram_ctrl #(
                     if (wait_counter > 0) begin
                         wait_counter <= wait_counter - 1;
                     end else begin
+                        // One CMD_READ; the SDRAM bursts BURST_LEN words.
                         cmd <= CMD_READ;
                         sdram_ba <= lat_bank;
-                        sdram_addr <= {{(ROW_BITS-COL_BITS-1){1'b0}}, 1'b0, lat_col}; // A10=0 (no auto-precharge)
-                        rd_pipe[0] <= 1;
+                        sdram_addr <= {{(ROW_BITS-COL_BITS-1){1'b0}}, 1'b0, lat_col};
+                        // Inject marker 0 on the CMD_READ cycle (matches the
+                        // original single-word timing); markers 1..N-1 follow on
+                        // the next cycles via rd_inject.
+                        rd_inject <= BEAT_BITS'(BURST_LEN - 1);
+                        rd_pipe[0] <= 1'b1;
+                        state <= S_READ_BURST;
+                    end
+                end
+
+                S_READ_BURST: begin
+                    // Wait until all injected markers have drained out as rd_valid.
+                    if (rd_inject == 0 && !(|rd_pipe)) begin
+                        busy <= 1'b0;
                         state <= S_IDLE;
                     end
                 end
@@ -258,13 +307,34 @@ module sdram_ctrl #(
                     if (wait_counter > 0) begin
                         wait_counter <= wait_counter - 1;
                     end else begin
-                        cmd <= CMD_WRITE;
-                        sdram_ba <= lat_bank;
-                        sdram_addr <= {{(ROW_BITS-COL_BITS-1){1'b0}}, 1'b0, lat_col}; // A10=0
-                        dq_oe <= 1;
-                        dq_out <= lat_wr_data;
+                        // Prime cycle: wr_data_req is asserted (combinationally)
+                        // so the master presents beat-0's address now; its data
+                        // arrives next cycle when we issue CMD_WRITE.
+                        state <= S_WRITE_CMD;
+                    end
+                end
+
+                S_WRITE_CMD: begin
+                    // Issue CMD_WRITE and latch beat 0 (valid now). Request
+                    // beat 1's address (wr_data_req high this cycle).
+                    cmd <= CMD_WRITE;
+                    sdram_ba <= lat_bank;
+                    sdram_addr <= {{(ROW_BITS-COL_BITS-1){1'b0}}, 1'b0, lat_col};
+                    dq_oe <= 1;
+                    dq_out <= wr_data;                      // beat 0
+                    wr_beat <= BEAT_BITS'(BURST_LEN - 1);   // beats 1..7 remain
+                    state <= S_WRITE_BURST;
+                end
+
+                S_WRITE_BURST: begin
+                    dq_oe <= 1;
+                    dq_out <= wr_data;                      // beats 1..7
+                    if (wr_beat == 1) begin
+                        // Last beat latched; burst done.
+                        busy <= 1'b0;
                         state <= S_IDLE;
                     end
+                    wr_beat <= wr_beat - 1'b1;
                 end
 
                 S_PRECHARGE: begin

@@ -1,3 +1,5 @@
+`default_nettype none
+
 module rasterizer #(
     parameter RES_W = 320,
     parameter RES_H = 200,
@@ -6,23 +8,23 @@ module rasterizer #(
     parameter SUBPIXEL = 4,
     parameter ADDR_WIDTH = $clog2((TILE_W/2) * (TILE_H/2))
 ) (
-    input  logic clk,
-    input  logic rst,
+    input  wire  clk,
+    input  wire  rst,
     // Tile offset in screen coordinates (pixel-aligned)
-    input  logic [$clog2(RES_W)-1:0] tile_x,
-    input  logic [$clog2(RES_H)-1:0] tile_y,
+    input  wire  [$clog2(RES_W)-1:0] tile_x,
+    input  wire  [$clog2(RES_H)-1:0] tile_y,
     // Triangle input (fixed-point: SUBPIXEL fractional bits, screen-space)
-    input  logic start,
-    input  logic [$clog2(RES_W)+SUBPIXEL-1:0] v0_x,
-    input  logic [$clog2(RES_H)+SUBPIXEL-1:0] v0_y,
-    input  logic [$clog2(RES_W)+SUBPIXEL-1:0] v1_x,
-    input  logic [$clog2(RES_H)+SUBPIXEL-1:0] v1_y,
-    input  logic [$clog2(RES_W)+SUBPIXEL-1:0] v2_x,
-    input  logic [$clog2(RES_H)+SUBPIXEL-1:0] v2_y,
-    input  logic signed [15:0] iz_init,  // 1/z at pixel (0,0)
-    input  logic signed [15:0] iz_dx,    // d(1/z)/dx per pixel
-    input  logic signed [15:0] iz_dy,    // d(1/z)/dy per pixel
-    input  logic [23:0] color,
+    input  wire  start,
+    input  wire  [$clog2(RES_W)+SUBPIXEL-1:0] v0_x,
+    input  wire  [$clog2(RES_H)+SUBPIXEL-1:0] v0_y,
+    input  wire  [$clog2(RES_W)+SUBPIXEL-1:0] v1_x,
+    input  wire  [$clog2(RES_H)+SUBPIXEL-1:0] v1_y,
+    input  wire  [$clog2(RES_W)+SUBPIXEL-1:0] v2_x,
+    input  wire  [$clog2(RES_H)+SUBPIXEL-1:0] v2_y,
+    input  wire  signed [15:0] iz_init,  // 1/z at pixel (0,0)
+    input  wire  signed [15:0] iz_dx,    // d(1/z)/dx per pixel
+    input  wire  signed [15:0] iz_dy,    // d(1/z)/dy per pixel
+    input  wire  [23:0] color,
     output logic done,
     // Framebuffer write (tile-local addressing)
     output logic [ADDR_WIDTH-1:0] fb_addr,
@@ -30,7 +32,7 @@ module rasterizer #(
     output logic [3:0]            fb_mask,
     // Z-buffer interface (tile-local addressing)
     output logic [ADDR_WIDTH-1:0] zb_rd_addr,
-    input  logic [15:0]           zb_rd_data [4],
+    input  wire  [15:0]           zb_rd_data [4],
     output logic [ADDR_WIDTH-1:0] zb_wr_addr,
     output logic [15:0]           zb_wr_data [4],
     output logic [3:0]            zb_wr_mask
