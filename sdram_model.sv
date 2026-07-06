@@ -3,7 +3,8 @@
 // Simplified SDR SDRAM behavioral model for simulation
 // Models W9825G6KH: 4 banks, 8192 rows, 512 cols, 16-bit
 // Only models basic command timing, not full protocol checking
-// Storage: 256 KB (128 K x 16 bits), addresses wrapped to fit.
+// Storage: MEM_DEPTH halfwords (default 384 KB = 192 K x 16), addresses
+// wrapped to ADDR_BITS. Every address used must be < MEM_DEPTH.
 
 module sdram_model #(
     parameter ROW_BITS  = 13,
@@ -12,6 +13,11 @@ module sdram_model #(
     parameter DATA_BITS = 16,
     parameter CAS_LATENCY = 2,
     parameter BURST_LEN = 8,
+    // Backing-store depth in halfwords, independent of ADDR_BITS. ADDR_BITS
+    // sets the address-wrap width (must cover the highest address used);
+    // MEM_DEPTH sets how much storage is actually allocated. Every address
+    // used must be < MEM_DEPTH. Default: 384 KB = 192 K halfwords.
+    parameter MEM_DEPTH = 192 * 1024,
     parameter INIT_FILE = ""     // optional $readmemh preload of the storage
 ) (
     input  wire                   sdram_clk,
@@ -38,7 +44,7 @@ module sdram_model #(
     localparam CMD_MRS       = 4'b0000;
 
     // Storage size: 256 KB = 128 K halfwords. Addresses wrap to 17 bits.
-    localparam ADDR_BITS = 17;
+    localparam ADDR_BITS = 18;   // address-wrap width (covers up to 0x3FFFF)
     localparam BEAT_BITS = $clog2(BURST_LEN+1);
 
     // Active row per bank
@@ -90,7 +96,7 @@ module sdram_model #(
     dpram #(
         .ADDR_WIDTH(ADDR_BITS),
         .DATA_WIDTH(DATA_BITS),
-        .DEPTH(1 << ADDR_BITS),
+        .DEPTH(MEM_DEPTH),
         .INIT_FILE(INIT_FILE)
     ) mem_inst (
         .clk     (sdram_clk),
