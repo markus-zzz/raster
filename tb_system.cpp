@@ -3,15 +3,6 @@
 #include "Vsystem_top.h"
 #include "Vsystem_top_system_top.h"
 #include "Vsystem_top_gpu_top.h"
-#ifdef SDRAM_INIT_MODE
-// Non-default SDRAM_INIT_FILE parameter gives the parameterized modules an
-// "__Iz1" name suffix.
-#include "Vsystem_top_sdram_model__Iz1.h"
-#include "Vsystem_top_dpram__A12_DB30000_Iz1.h"
-#else
-#include "Vsystem_top_sdram_model.h"
-#include "Vsystem_top_dpram__A12_DB30000.h"
-#endif
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -353,14 +344,16 @@ void finalize_bins(auto &mem) {
     }
 }
 
-// Dump the entire SDRAM contents as a flat $readmemh hex file (one 16-bit word
-// per line, in address order). Loadable directly into the SDRAM model's BRAM
-// via $readmemh on real HW. Small enough (128 K words) to dump in full.
-void dump_sdram_hex(const char *fn, const auto &mem) {
+// Dump the on-chip input ROM image as a flat $readmemh hex file (one 16-bit
+// word per line, address order). This is copied into SDRAM at startup by the
+// hardware loader (sdram_loader), in both simulation and on the FPGA.
+static const int INPUT_BASE  = 0x20000;   // = MATRIX_BASE (halfwords)
+static const int INPUT_WORDS = 23680;     // 0x20000..0x25C80, multiple of 8
+void dump_inputs_hex(const char *fn, const std::vector<uint16_t> &rom) {
     FILE *f = fopen(fn, "w");
     if (!f) { printf("ERROR: cannot open %s for write\n", fn); return; }
-    for (int i = 0; i < SDRAM_WORDS; i++)
-        fprintf(f, "%04X\n", mem[i]);
+    for (int i = 0; i < INPUT_WORDS; i++)
+        fprintf(f, "%04X\n", rom[i]);
     fclose(f);
 }
 
@@ -379,12 +372,60 @@ void write_ppm(const char *fn) {
 int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
     Verilated::traceEverOn(true);
-    Vsystem_top *dut = new Vsystem_top;
-
     bool do_trace = false;
     for (int i = 1; i < argc; i++)
         if (strcmp(argv[i], "--trace") == 0) do_trace = true;
 
+    load_obj("suzanne.obj");
+    if (vertices.empty()) return 1;
+
+    printf("Screen: %dx%d, Tile: %dx%d, Grid: %dx%d\n", W, H, TW, TH, NTX, NTY);
+
+    const int NUM_FRAMES = 90;
+
+    // Build the on-chip input ROM image (mesh + NUM_FRAMES matrices + light)
+    // and write it to sdram_inputs.hex. The hardware loader (sdram_loader)
+    // copies it into SDRAM at startup, in both simulation and on the FPGA.
+    {
+        std::vector<uint16_t> rom(INPUT_WORDS, 0);
+        auto w16 = [&](int a, uint16_t v){ rom[a - INPUT_BASE] = v; };
+        auto w32 = [&](int a, uint32_t v){ w16(a, v & 0xFFFF); w16(a+1, (v>>16) & 0xFFFF); };
+        const int MATRIX_STRIDE = 24;
+        for (int f = 0; f < NUM_FRAMES; f++) {
+            float ay = f * 2.0f * (float)M_PI / NUM_FRAMES;         // Y: 1 revolution
+            float ax = f * 2.0f * 2.0f * (float)M_PI / NUM_FRAMES;  // X: 2 revolutions
+            m4 Mf = build_view_matrix(ay, ax, v3{0,0,0});
+            int mb = MATRIX_BASE + f * MATRIX_STRIDE;
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 4; j++)
+                    w32(mb + (i*4+j)*2, (uint32_t)Mf.e[i][j]);
+        }
+        w32(LIGHT_BASE + 0, (uint32_t)NEG_LIGHT_DIR.x);
+        w32(LIGHT_BASE + 2, (uint32_t)NEG_LIGHT_DIR.y);
+        w32(LIGHT_BASE + 4, (uint32_t)NEG_LIGHT_DIR.z);
+        for (size_t i = 0; i < vertices.size(); i++) {
+            w32(VTX_BASE + i*8 + 0, (uint32_t)vertices[i].x);
+            w32(VTX_BASE + i*8 + 2, (uint32_t)vertices[i].y);
+            w32(VTX_BASE + i*8 + 4, (uint32_t)vertices[i].z);
+        }
+        for (size_t f = 0; f < faces.size(); f++) {
+            int b = FACE_BASE + f*16;
+            w16(b+0, faces[f].v[0]);
+            w16(b+1, faces[f].v[1]);
+            w16(b+2, faces[f].v[2]);
+            w32(b+3,  (uint32_t)faces[f].normal.x);
+            w32(b+5,  (uint32_t)faces[f].normal.y);
+            w32(b+7,  (uint32_t)faces[f].normal.z);
+            w32(b+9,  (uint32_t)faces[f].color.x);
+            w32(b+11, (uint32_t)faces[f].color.y);
+            w32(b+13, (uint32_t)faces[f].color.z);
+        }
+        dump_inputs_hex("sdram_inputs.hex", rom);
+    }
+
+    // Construct the DUT now that sdram_inputs.hex exists (the loader's ROM reads
+    // it via $readmemh at construction time).
+    Vsystem_top *dut = new Vsystem_top;
     VerilatedFstC *tfp = nullptr;
     if (do_trace) {
         tfp = new VerilatedFstC;
@@ -392,16 +433,6 @@ int main(int argc, char **argv) {
         tfp->open("gpu.fst");
     }
     int sim_time = 0;
-
-    load_obj("suzanne.obj");
-    if (vertices.empty()) return 1;
-
-    printf("Screen: %dx%d, Tile: %dx%d, Grid: %dx%d\n", W, H, TW, TH, NTX, NTY);
-
-    // Backdoor pointer to SDRAM model memory
-    auto &sdram_mem = dut->system_top->sdram->mem_inst->mem;
-
-    const int NUM_FRAMES = 90;
 
     // Reset
     dut->rst = 1;
@@ -426,59 +457,9 @@ int main(int argc, char **argv) {
 
     dut->nfaces = (uint16_t)faces.size();
 
-    auto w32 = [&](int a, uint32_t v){ sdram_mem[a]=v&0xFFFF; sdram_mem[a+1]=(v>>16)&0xFFFF; };
-#ifndef SDRAM_INIT_MODE
-    // Write the geometry pass inputs ONCE into the persistent region (0x20000+).
-    // The HW geom_front cycles through NUM_FRAMES matrices (mat_index advances
-    // one per frame), so the animation is driven entirely in hardware.
-    {
-        // NUM_FRAMES matrices (one rotation step each), MATRIX_STRIDE hw apart.
-        const int MATRIX_STRIDE = 24;
-        for (int f = 0; f < NUM_FRAMES; f++) {
-            float ay = f * 2.0f * (float)M_PI / NUM_FRAMES;
-            m4 Mf = build_view_matrix(ay, -0.3f, v3{0,0,0});
-            int mb = MATRIX_BASE + f * MATRIX_STRIDE;
-            for (int i = 0; i < 3; i++)
-                for (int j = 0; j < 4; j++)
-                    w32(mb + (i*4+j)*2, (uint32_t)Mf.e[i][j]);
-        }
-        // negated light direction
-        w32(LIGHT_BASE + 0, (uint32_t)NEG_LIGHT_DIR.x);
-        w32(LIGHT_BASE + 2, (uint32_t)NEG_LIGHT_DIR.y);
-        w32(LIGHT_BASE + 4, (uint32_t)NEG_LIGHT_DIR.z);
-        // vertices (Q12.20)
-        for (size_t i = 0; i < vertices.size(); i++) {
-            w32(VTX_BASE + i*8 + 0, (uint32_t)vertices[i].x);
-            w32(VTX_BASE + i*8 + 2, (uint32_t)vertices[i].y);
-            w32(VTX_BASE + i*8 + 4, (uint32_t)vertices[i].z);
-        }
-        // faces: 3 vertex indices + pre-negated normal + colour
-        for (size_t f = 0; f < faces.size(); f++) {
-            int b = FACE_BASE + f*16;
-            sdram_mem[b+0] = faces[f].v[0];
-            sdram_mem[b+1] = faces[f].v[1];
-            sdram_mem[b+2] = faces[f].v[2];
-            w32(b+3,  (uint32_t)faces[f].normal.x);
-            w32(b+5,  (uint32_t)faces[f].normal.y);
-            w32(b+7,  (uint32_t)faces[f].normal.z);
-            w32(b+9,  (uint32_t)faces[f].color.x);
-            w32(b+11, (uint32_t)faces[f].color.y);
-            w32(b+13, (uint32_t)faces[f].color.z);
-        }
-        // Preload image for gamebub/FPGA (contains all NUM_FRAMES matrices +
-        // mesh); a target that $readmemh's this can animate in hardware.
-        dump_sdram_hex("sdram_init.hex", sdram_mem);
-    }
-#else
-    (void)w32;
-#endif
-
     for (int frame = 0; frame < NUM_FRAMES; frame++) {
-        // Clear FB region (inputs at 0x20000+ are untouched).
-        for (int i = 0; i < W * H; i++) sdram_mem[FB_BASE + i] = 0;
-
-        // Start the frame (HW runs the geometry pass with matrix[frame], then
-        // rasterises).
+        // Start the frame (HW loads inputs on the first frame, then runs the
+        // geometry pass with matrix[frame] and rasterises).
         dut->start = 1;
         dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
         dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;

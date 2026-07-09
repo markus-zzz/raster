@@ -49,6 +49,7 @@ module rasterizer #(
     typedef enum logic [2:0] {
         IDLE,
         SETUP,
+        SETUP2,
         INIT_ROW,
         TRAVERSE
     } state_t;
@@ -72,6 +73,12 @@ module rasterizer #(
     logic signed [15:0] iz_row, iz_col;
     logic signed [15:0] iz_dx_r, iz_dy_r;
 
+    // Pipeline registers for the two-cycle edge/iz setup (SETUP -> SETUP2).
+    // The multiplies are registered in SETUP; the final subtract/sum happens in
+    // SETUP2, so no single cycle carries a full multiply-then-add.
+    logic signed [EW-1:0] e0_m0_r, e0_m1_r, e1_m0_r, e1_m1_r, e2_m0_r, e2_m1_r;
+    logic signed [15:0]   iz_m0_r, iz_m1_r, iz_init_r;
+
     // Top-left rule
     logic tl0, tl1, tl2;
 
@@ -80,18 +87,30 @@ module rasterizer #(
     assign color_565 = {color[23:19], color[15:10], color[7:3]};
 
     // Edge function at a sub-pixel point
-    function automatic logic signed [EW-1:0] edge_func(
+    // Edge function = EW'(dx*dpy) - EW'(dy*dpx), split into its two products so
+    // the multiply and the subtract can be placed in separate pipeline stages.
+    function automatic logic signed [EW-1:0] edge_mul0(   // EW'(dx * dpy)
         input logic [VW-1:0] v0x, input logic [VH-1:0] v0y,
         input logic [VW-1:0] v1x, input logic [VH-1:0] v1y,
         input logic [VW-1:0] px,  input logic [VH-1:0] py
     );
-        logic signed [VW:0] dx, dpx;
-        logic signed [VH:0] dy, dpy;
+        logic signed [VW:0] dx;
+        logic signed [VH:0] dpy;
         dx  = $signed({1'b0, v1x}) - $signed({1'b0, v0x});
+        dpy = $signed({1'b0, py})  - $signed({1'b0, v0y});
+        return EW'(dx * dpy);
+    endfunction
+
+    function automatic logic signed [EW-1:0] edge_mul1(   // EW'(dy * dpx)
+        input logic [VW-1:0] v0x, input logic [VH-1:0] v0y,
+        input logic [VW-1:0] v1x, input logic [VH-1:0] v1y,
+        input logic [VW-1:0] px,  input logic [VH-1:0] py
+    );
+        logic signed [VH:0] dy;
+        logic signed [VW:0] dpx;
         dy  = $signed({1'b0, v1y}) - $signed({1'b0, v0y});
         dpx = $signed({1'b0, px})  - $signed({1'b0, v0x});
-        dpy = $signed({1'b0, py})  - $signed({1'b0, v0y});
-        return EW'(dx * dpy) - EW'(dy * dpx);
+        return EW'(dy * dpx);
     endfunction
 
     function automatic logic [CW-1:0] min3x(input logic [CW-1:0] a, b, c);
@@ -130,7 +149,6 @@ module rasterizer #(
 
     logic signed [EW-1:0] setup_e0_dx, setup_e1_dx, setup_e2_dx;
     logic signed [EW-1:0] setup_e0_dy, setup_e1_dy, setup_e2_dy;
-    logic signed [EW-1:0] setup_e0_init, setup_e1_init, setup_e2_init;
     logic [CW-1:0] bbox_minx, bbox_maxx;
     logic [CH-1:0] bbox_miny, bbox_maxy;
 
@@ -157,11 +175,6 @@ module rasterizer #(
         // Pixel center of bounding box origin in sub-pixel coords
         origin_x = {minx, {SUBPIXEL{1'b0}}} | VW'(1 << (SUBPIXEL - 1));
         origin_y = {miny, {SUBPIXEL{1'b0}}} | VH'(1 << (SUBPIXEL - 1));
-
-        // Edge function at the pixel center of the bounding box origin
-        setup_e0_init = edge_func(v0_x, v0_y, v1_x, v1_y, origin_x, origin_y);
-        setup_e1_init = edge_func(v1_x, v1_y, v2_x, v2_y, origin_x, origin_y);
-        setup_e2_init = edge_func(v2_x, v2_y, v0_x, v0_y, origin_x, origin_y);
     end
 
     // --- Pipeline stage 1 registers ---
@@ -231,23 +244,40 @@ module rasterizer #(
                     e0_dx <= setup_e0_dx; e0_dy <= setup_e0_dy;
                     e1_dx <= setup_e1_dx; e1_dy <= setup_e1_dy;
                     e2_dx <= setup_e2_dx; e2_dy <= setup_e2_dy;
-                    e0_row <= setup_e0_init;
-                    e1_row <= setup_e1_init;
-                    e2_row <= setup_e2_init;
+
+                    // Stage 1: register the edge-function products (the multiply).
+                    e0_m0_r <= edge_mul0(v0_x, v0_y, v1_x, v1_y, origin_x, origin_y);
+                    e0_m1_r <= edge_mul1(v0_x, v0_y, v1_x, v1_y, origin_x, origin_y);
+                    e1_m0_r <= edge_mul0(v1_x, v1_y, v2_x, v2_y, origin_x, origin_y);
+                    e1_m1_r <= edge_mul1(v1_x, v1_y, v2_x, v2_y, origin_x, origin_y);
+                    e2_m0_r <= edge_mul0(v2_x, v2_y, v0_x, v0_y, origin_x, origin_y);
+                    e2_m1_r <= edge_mul1(v2_x, v2_y, v0_x, v0_y, origin_x, origin_y);
 
                     // Top-left rule (based on sub-pixel edge direction)
                     tl0 <= (setup_e0_dx > 0) || (setup_e0_dx == 0 && setup_e0_dy < 0);
                     tl1 <= (setup_e1_dx > 0) || (setup_e1_dx == 0 && setup_e1_dy < 0);
                     tl2 <= (setup_e2_dx > 0) || (setup_e2_dx == 0 && setup_e2_dy < 0);
 
-                    // iz_init is 1/z at pixel (0,0); compute value at bbox origin
-                    iz_dx_r <= iz_dx;
-                    iz_dy_r <= iz_dy;
-                    iz_row <= iz_init + iz_dx * $signed({1'b0, minx}) + iz_dy * $signed({1'b0, miny});
+                    // iz plane: register d(1/z) and the origin products (multiply).
+                    iz_dx_r   <= iz_dx;
+                    iz_dy_r   <= iz_dy;
+                    iz_init_r <= iz_init;
+                    iz_m0_r   <= 16'(iz_dx * $signed({1'b0, minx}));
+                    iz_m1_r   <= 16'(iz_dy * $signed({1'b0, miny}));
 
                     qx <= minx;
                     qy <= miny;
-                    state <= INIT_ROW;
+                    state <= SETUP2;
+                end
+
+                // Stage 2: combine the registered products (subtract / sum). No
+                // multiply in this cycle, so the path is short.
+                SETUP2: begin
+                    e0_row <= e0_m0_r - e0_m1_r;
+                    e1_row <= e1_m0_r - e1_m1_r;
+                    e2_row <= e2_m0_r - e2_m1_r;
+                    iz_row <= iz_init_r + iz_m0_r + iz_m1_r;
+                    state  <= INIT_ROW;
                 end
 
                 INIT_ROW: begin

@@ -23,7 +23,14 @@ module sdram_ctrl #(
     parameter tRCD        = 2,   // activate to read/write
     parameter tRC         = 7,   // activate to activate (same bank)
     parameter tMRD        = 2,   // mode register set
-    parameter REFRESH_INTERVAL = 780  // 7.8us / 10ns
+    parameter REFRESH_INTERVAL = 780, // 7.8us / 10ns
+    // Read-capture latency: total clocks from a READ command to rd_data valid.
+    // Default CAS_LATENCY+3 accounts for command launch, the chip's CAS access
+    // and the registered DQ input capture. On real hardware the round-trip
+    // (clock-to-out + board delay) may shift this by a whole cycle; sweep this
+    // together with the SDRAM clock phase (clkgen SDRAM_PHASE) to find the
+    // working point. In simulation (zero-delay model) the default is correct.
+    parameter READ_LAT_ADJ = 3
 ) (
     input  wire  clk,
     input  wire  rst,
@@ -88,9 +95,12 @@ module sdram_ctrl #(
     logic [3:0]  wait_counter;
     logic [9:0]  refresh_counter;
 
-    // Read pipeline: CAS_LATENCY + 2 cycles total (1 for our READ->model, 1 for
-    // model->our DQ_in). For a burst we inject BURST_LEN consecutive markers.
-    logic [CAS_LATENCY+1:0] rd_pipe;
+    // Read pipeline: a marker is injected at each READ beat and shifted for
+    // RD_LAT cycles; when it reaches the end the (IOB-registered) DQ input is
+    // captured. RD_LAT is tunable for real-hardware round-trip latency.
+    localparam int RD_LAT = CAS_LATENCY + READ_LAT_ADJ;
+    logic [RD_LAT-1:0]      rd_pipe;
+    logic [DATA_BITS-1:0]   dq_in_r;     // registered DQ input (packs into IOB)
     logic [BEAT_BITS-1:0]   rd_inject;  // read beats still to inject
     logic [BEAT_BITS-1:0]   wr_beat;    // write beats still to drive
 
@@ -167,11 +177,14 @@ module sdram_ctrl #(
             dq_oe <= 0;
 
             // Read data pipeline: a marker reaching the end produces a rd_valid.
-            rd_pipe <= {rd_pipe[CAS_LATENCY:0], (rd_inject != 0) ? 1'b1 : 1'b0};
+            // DQ is captured through a registered input (dq_in_r) for a clean,
+            // IOB-packed sample point.
+            dq_in_r <= sdram_dq_in;
+            rd_pipe <= {rd_pipe[RD_LAT-2:0], (rd_inject != 0) ? 1'b1 : 1'b0};
             if (rd_inject != 0)
                 rd_inject <= rd_inject - 1'b1;
-            if (rd_pipe[CAS_LATENCY+1]) begin
-                rd_data <= sdram_dq_in;
+            if (rd_pipe[RD_LAT-1]) begin
+                rd_data <= dq_in_r;
                 rd_valid <= 1;
             end
 

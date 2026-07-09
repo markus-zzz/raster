@@ -3,7 +3,7 @@ VERILATOR = ~/work/install/bin/verilator
 
 SRCS = system_top.sv gpu_top.sv raster_top.sv rasterizer.sv dpram.sv \
        sdram_ctrl.sv sdram_model.sv arbiter.sv display_ctrl.sv \
-       geom_front.sv geom_engine.sv tb_system.cpp
+       geom_front.sv geom_engine.sv sdram_loader.sv fb_pattern.sv sdram_memtest.sv tb_system.cpp
 
 VFLAGS = --cc --exe --build -j 0 --trace-fst -Wall \
     -Wno-UNUSEDPARAM -Wno-UNUSEDSIGNAL -Wno-WIDTHTRUNC -Wno-WIDTHEXPAND \
