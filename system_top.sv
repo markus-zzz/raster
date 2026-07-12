@@ -97,7 +97,7 @@ module system_top #(
     logic [15:0]       load_rd_data;
     logic              load_rd_valid;
     logic              load_ready;
-    logic              load_start, load_done;
+    logic              load_done;
 
     // Arbiter -> SDRAM controller
     logic [MEM_AW-1:0] mem_addr;
@@ -116,36 +116,37 @@ module system_top #(
     logic        sdram_dq_model_oe;
     wire  [15:0] sdram_dq_to_ctrl = SIM_MODEL ? sdram_dq_model_out : sdram_dq_in;
 
-    // Frame sequencing: one-time SDRAM load, then geometry pass, then raster.
-    typedef enum logic [1:0] { SYS_IDLE, SYS_LOAD, SYS_GEOM, SYS_RASTER } sys_t;
+    // Frame sequencing driven by the CPU handshake: the CPU writes the matrix
+    // for the next frame into SDRAM and pulses "matrix ready" (an MMIO write);
+    // the sequencer runs the geometry + raster passes for that matrix and bumps
+    // frame_count, which the CPU polls to learn the frame was consumed+rendered.
+    typedef enum logic [1:0] { SYS_IDLE, SYS_GEOM, SYS_RASTER } sys_t;
     sys_t  sys_state;
     logic  geom_start, gpu_start, geom_done, gpu_done;
-    logic  loaded;            // inputs have been copied into SDRAM
-    logic [15:0] frame_ctr;   // selects the per-frame matrix (0..NUM_MATRICES-1)
+    logic         matrix_ready;   // CPU has a fresh matrix waiting in SDRAM
+    logic [31:0]  frame_count;    // completed frames (polled by the CPU)
+    // CPU MMIO write to the control region (0x2xxx_xxxx) raises matrix_ready.
+    wire cpu_mmio_wr = cpu_mem_valid && (cpu_mem_addr[31:28] == 4'h2)
+                                     && (|cpu_mem_wstrb);
 
     always_ff @(posedge clk) begin
         if (rst) begin
             sys_state <= SYS_IDLE; geom_start <= 0; gpu_start <= 0; done <= 0;
-            frame_ctr <= 0; loaded <= 0; load_start <= 0;
+            matrix_ready <= 0; frame_count <= 0;
         end else begin
-            geom_start <= 0; gpu_start <= 0; done <= 0; load_start <= 0;
+            geom_start <= 0; gpu_start <= 0; done <= 0;
+            if (cpu_mmio_wr) matrix_ready <= 1;   // set (clear below wins on collision)
             case (sys_state)
-                SYS_IDLE:   if (start) begin
-                                if (!loaded) begin load_start <= 1; sys_state <= SYS_LOAD; end
-                                else if (TEST_MODE != 0) done <= 1;  // static FB, nothing to redo
-                                else         begin geom_start <= 1; sys_state <= SYS_GEOM; end
-                            end
-                SYS_LOAD:   if (load_done) begin
-                                loaded <= 1;
-                                if (TEST_MODE != 0) begin done <= 1; sys_state <= SYS_IDLE; end
-                                else begin geom_start <= 1; sys_state <= SYS_GEOM; end
+                SYS_IDLE:   if (start && matrix_ready) begin
+                                matrix_ready <= 0;         // consume the matrix
+                                geom_start   <= 1;
+                                sys_state    <= SYS_GEOM;
                             end
                 SYS_GEOM:   if (geom_done) begin gpu_start <= 1; sys_state <= SYS_RASTER; end
                 SYS_RASTER: if (gpu_done) begin
-                                done <= 1;
-                                frame_ctr <= (frame_ctr == NUM_MATRICES-1) ? 16'd0
-                                                                           : frame_ctr + 16'd1;
-                                sys_state <= SYS_IDLE;
+                                done        <= 1;
+                                frame_count <= frame_count + 32'd1;
+                                sys_state   <= SYS_IDLE;
                             end
                 default:    sys_state <= SYS_IDLE;
             endcase
@@ -165,12 +166,13 @@ module system_top #(
         .BINLIST_BASE(24'h00_5000)
     ) geom (
         .clk(clk), .rst(rst), .start(geom_start), .nfaces(nfaces),
-        .mat_index(frame_ctr), .done(geom_done),
+        .mat_index(16'd0), .done(geom_done),   // single CPU-computed matrix at MATRIX_BASE
         .mem_addr(geom_addr), .mem_req(geom_req), .mem_we(geom_we),
         .mem_wr_data(geom_wr_data), .mem_wr_data_req(geom_wr_data_req),
         .mem_rd_data(geom_rd_data), .mem_rd_valid(geom_rd_valid), .mem_ready(geom_ready)
     );
 
+  /*
     // m2 master: normally the startup loader; in a TEST_MODE, a framebuffer
     // colour-bar writer (1) or a self-checking memory test (2) instead. All are
     // one-shot startup masters driven by load_start/load_done onto the same
@@ -214,6 +216,142 @@ module system_top #(
             .mem_rd_data(load_rd_data), .mem_rd_valid(load_rd_valid), .mem_ready(load_ready)
         );
     end endgenerate
+  */
+
+  // XXX: Put the entire CPU subsystem in its own module
+  logic cpu_mem_valid;
+  logic cpu_mem_instr;
+  logic cpu_mem_ready;
+  logic [31:0] cpu_mem_addr;
+  logic [31:0] cpu_mem_wdata;
+  logic [3:0]  cpu_mem_wstrb;
+  logic [31:0] cpu_mem_rdata;
+  logic [31:0] ram_rdata;
+  logic [31:0] rom_rdata;
+
+  logic        cpu_pcpi_valid;
+  logic [31:0] cpu_pcpi_insn;
+  logic [31:0] cpu_pcpi_rs1;
+  logic [31:0] cpu_pcpi_rs2;
+  logic        cpu_pcpi_wait;
+  logic        cpu_pcpi_ready;
+
+  logic cpu_pcpi_insn_wr_sdram;
+  assign cpu_pcpi_insn_wr_sdram = cpu_pcpi_valid && (cpu_pcpi_insn == 32'h44b5100b);
+
+  assign load_done = 1;
+
+  // CPU ROM
+  spram2 #(
+      .ADDR_WIDTH(15),
+      .DATA_WIDTH(32),
+      .INIT_FILE("bios.vh")
+  ) u_rom (
+      .clk (clk),
+      .addr(cpu_mem_addr[31:2]),
+      .rd_data(rom_rdata),
+      .wr_en(1'b0)
+  );
+
+  // CPU RAM
+  genvar gi;
+  generate
+    for (gi = 0; gi < 4; gi = gi + 1) begin : ram
+      spram2 #(
+          .ADDR_WIDTH(10),
+          .DATA_WIDTH(8)
+      ) u_ram (
+          .clk (clk),
+          .addr(mstate == M_REQ || mstate == M_WR ? {cpu_pcpi_rs1[31:4], beat[2:1]} : cpu_mem_addr[31:2]),
+          .rd_data(ram_rdata[(gi+1)*8-1:gi*8]),
+          .wr_data(cpu_mem_wdata[(gi+1)*8-1:gi*8]),
+          .wr_en  (cpu_mem_wstrb[gi] && (cpu_mem_valid && cpu_mem_addr[31:28] == 4'h1))
+      );
+    end
+  endgenerate
+
+  // CPU
+  picorv32 #(
+      .COMPRESSED_ISA(1),
+      .ENABLE_PCPI(1),
+      .ENABLE_IRQ(1),
+      .ENABLE_MUL(1),
+      .ENABLE_DIV(1)
+  ) u_cpu (
+      .clk(clk),
+      .resetn(~rst),
+      // Pico Co-Processor Interface (PCPI)
+      .pcpi_valid(cpu_pcpi_valid),
+      .pcpi_insn (cpu_pcpi_insn),
+      .pcpi_rs1  (cpu_pcpi_rs1),
+      .pcpi_rs2  (cpu_pcpi_rs2),
+      .pcpi_wr   (1'b0),
+      .pcpi_rd   (32'h0),
+      .pcpi_wait (cpu_pcpi_wait),
+      .pcpi_ready(cpu_pcpi_ready),
+      // PicoRV32 Native Memory Interface
+      .mem_valid(cpu_mem_valid),
+      .mem_instr(cpu_mem_instr),
+      .mem_ready(cpu_mem_ready),
+      .mem_addr (cpu_mem_addr),
+      .mem_wdata(cpu_mem_wdata),
+      .mem_wstrb(cpu_mem_wstrb),
+      .mem_rdata(cpu_mem_rdata)
+  );
+
+  always_comb begin
+    casex (cpu_mem_addr)
+      32'h0xxx_xxxx: cpu_mem_rdata = rom_rdata;
+      32'h1xxx_xxxx: cpu_mem_rdata = ram_rdata;
+      32'h2xxx_xxxx: cpu_mem_rdata = frame_count;   // MMIO: completed-frame count
+      default: cpu_mem_rdata = 0;
+    endcase
+  end
+
+  always_ff @(posedge clk) begin
+    if (rst) cpu_mem_ready <= 0;
+    else begin
+      casex (cpu_mem_addr)
+        32'h0xxx_xxxx: cpu_mem_ready <= ~cpu_mem_ready & cpu_mem_valid;
+        32'h1xxx_xxxx: cpu_mem_ready <= ~cpu_mem_ready & cpu_mem_valid;
+        32'h2xxx_xxxx: cpu_mem_ready <= ~cpu_mem_ready & cpu_mem_valid;
+        default:       cpu_mem_ready <= 0;
+      endcase
+    end
+  end
+
+    // ---- burst write engine (mirrors geom_front / gpu_top) ----
+    typedef enum logic [1:0] { M_IDLE, M_REQ, M_WR, M_RDY } mst_t;
+    mst_t              mstate;
+    logic [MEM_AW-1:0] burst_addr;
+    logic [2:0]   beat;
+
+    assign load_addr    = cpu_pcpi_rs2;
+    assign load_we      = 1'b1;               // loader only ever writes
+    assign load_req     = (mstate == M_REQ);
+    assign load_wr_data = ~beat[0] ? ram_rdata[31:16] : ram_rdata[15:0];
+
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            mstate <= M_IDLE; beat <= 0;
+        end else begin
+            case (mstate)
+                M_IDLE: if (cpu_pcpi_insn_wr_sdram) begin beat <= 0; mstate <= M_REQ; end
+                M_REQ:  if (load_ready) begin beat <= 0; mstate <= M_WR; end
+                M_WR:   if (load_wr_data_req) begin
+                            beat <= beat + 1'b1;
+                            if (beat == 7) begin mstate <= M_RDY; end
+                        end
+                M_RDY: mstate <= M_IDLE;
+                default: mstate <= M_IDLE;
+            endcase
+        end
+    end
+
+    assign cpu_pcpi_wait = (mstate != M_IDLE);
+    assign cpu_pcpi_ready = (mstate == M_RDY);
+
 
     gpu_top #(
         .FRAME_W(FRAME_W),
@@ -263,7 +401,7 @@ module system_top #(
     ) arb (
         .clk(clk),
         .rst(rst),
-        // m0 = GPU (highest priority)
+        // m0 = GPU (highest priority) // XXX: Should be other way around. Display should have highest priority! If starved the screen will show tearing
         .m0_addr(gpu_addr),
         .m0_req(gpu_req),
         .m0_we(gpu_we),

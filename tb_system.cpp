@@ -352,8 +352,10 @@ static const int INPUT_WORDS = 23680;     // 0x20000..0x25C80, multiple of 8
 void dump_inputs_hex(const char *fn, const std::vector<uint16_t> &rom) {
     FILE *f = fopen(fn, "w");
     if (!f) { printf("ERROR: cannot open %s for write\n", fn); return; }
+    fprintf(f, "#include <stdint.h>\nconst uint16_t sdram_inputs[] = {\n");
     for (int i = 0; i < INPUT_WORDS; i++)
-        fprintf(f, "%04X\n", rom[i]);
+        fprintf(f, "  0x%04X,\n", rom[i]);
+    fprintf(f, "};");
     fclose(f);
 }
 
@@ -373,33 +375,30 @@ int main(int argc, char **argv) {
     Verilated::commandArgs(argc, argv);
     Verilated::traceEverOn(true);
     bool do_trace = false;
-    for (int i = 1; i < argc; i++)
+    bool emit_inputs_only = false;   // just (re)generate sdram_inputs.hex and exit
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--trace") == 0) do_trace = true;
+        if (strcmp(argv[i], "--emit-inputs") == 0) emit_inputs_only = true;
+    }
 
     load_obj("suzanne.obj");
     if (vertices.empty()) return 1;
 
     printf("Screen: %dx%d, Tile: %dx%d, Grid: %dx%d\n", W, H, TW, TH, NTX, NTY);
 
-    const int NUM_FRAMES = 90;
+    // Number of frames the standalone sim renders (the FPGA runs forever). Kept
+    // small: each frame is a full geometry+raster pass, so this is just enough
+    // to check the CPU-computed matrix animates correctly.
+    const int NUM_FRAMES = 3;
 
-    // Build the on-chip input ROM image (mesh + NUM_FRAMES matrices + light)
-    // and write it to sdram_inputs.hex. The hardware loader (sdram_loader)
-    // copies it into SDRAM at startup, in both simulation and on the FPGA.
+    // Build the on-chip input image (mesh + light) and write it as a C header
+    // (sdram_inputs.hex). The CPU firmware #includes it and DMAs it into SDRAM
+    // at boot. The per-frame matrices are NO LONGER baked here -- the CPU
+    // computes them at runtime -- so the matrix region is left zeroed.
     {
         std::vector<uint16_t> rom(INPUT_WORDS, 0);
         auto w16 = [&](int a, uint16_t v){ rom[a - INPUT_BASE] = v; };
         auto w32 = [&](int a, uint32_t v){ w16(a, v & 0xFFFF); w16(a+1, (v>>16) & 0xFFFF); };
-        const int MATRIX_STRIDE = 24;
-        for (int f = 0; f < NUM_FRAMES; f++) {
-            float ay = f * 2.0f * (float)M_PI / NUM_FRAMES;         // Y: 1 revolution
-            float ax = f * 2.0f * 2.0f * (float)M_PI / NUM_FRAMES;  // X: 2 revolutions
-            m4 Mf = build_view_matrix(ay, ax, v3{0,0,0});
-            int mb = MATRIX_BASE + f * MATRIX_STRIDE;
-            for (int i = 0; i < 3; i++)
-                for (int j = 0; j < 4; j++)
-                    w32(mb + (i*4+j)*2, (uint32_t)Mf.e[i][j]);
-        }
         w32(LIGHT_BASE + 0, (uint32_t)NEG_LIGHT_DIR.x);
         w32(LIGHT_BASE + 2, (uint32_t)NEG_LIGHT_DIR.y);
         w32(LIGHT_BASE + 4, (uint32_t)NEG_LIGHT_DIR.z);
@@ -423,8 +422,11 @@ int main(int argc, char **argv) {
         dump_inputs_hex("sdram_inputs.hex", rom);
     }
 
-    // Construct the DUT now that sdram_inputs.hex exists (the loader's ROM reads
-    // it via $readmemh at construction time).
+    // In --emit-inputs mode we only (re)generate the header the firmware needs;
+    // the CPU ROM (bios.vh) is then built from it before the real sim run.
+    if (emit_inputs_only) { printf("Wrote sdram_inputs.hex\n"); return 0; }
+
+    // Construct the DUT (its CPU ROM reads bios.vh via $readmemh at construction).
     Vsystem_top *dut = new Vsystem_top;
     VerilatedFstC *tfp = nullptr;
     if (do_trace) {
@@ -458,18 +460,16 @@ int main(int argc, char **argv) {
     dut->nfaces = (uint16_t)faces.size();
 
     for (int frame = 0; frame < NUM_FRAMES; frame++) {
-        // Start the frame (HW loads inputs on the first frame, then runs the
-        // geometry pass with matrix[frame] and rasterises).
+        // Assert start and hold it: the sequencer renders as soon as the CPU
+        // has published this frame's matrix (matrix_ready), and bumps
+        // frame_count when done. The CPU paces the animation via that handshake.
         dut->start = 1;
-        dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
-        dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
-        dut->start = 0;
-
         int timeout = 50000000;
         while (!dut->done && timeout-- > 0) {
             dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
             dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
         }
+        dut->start = 0;   // drop start so no new render begins during capture
         if (timeout <= 0) { printf("Frame %03d: TIMEOUT\n", frame); break; }
 
         // Capture the framebuffer through the display controller.

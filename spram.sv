@@ -1,18 +1,15 @@
 `default_nettype none
 
-module dpram #(
+module spram2 #(
     parameter ADDR_WIDTH = 17,
     parameter DATA_WIDTH = 16,
     parameter DEPTH = 1 << ADDR_WIDTH,
     parameter INIT_FILE = ""     // optional $readmemh preload
 ) (
     input  wire  clk,
-    // Write port
     input  wire                     wr_en,
-    input  wire  [ADDR_WIDTH-1:0]   wr_addr,
+    input  wire  [ADDR_WIDTH-1:0]   addr,
     input  wire  [DATA_WIDTH-1:0]   wr_data,
-    // Read port
-    input  wire  [ADDR_WIDTH-1:0]   rd_addr,
     output logic [DATA_WIDTH-1:0]   rd_data
 );
 
@@ -25,8 +22,8 @@ module dpram #(
 
     always_ff @(posedge clk) begin
         if (wr_en)
-            mem[wr_addr] <= wr_data;
-        rd_data <= mem[rd_addr];
+            mem[addr] <= wr_data;
+        rd_data <= mem[addr];
     end
 
 endmodule
