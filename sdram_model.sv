@@ -17,7 +17,7 @@ module sdram_model #(
     // sets the address-wrap width (must cover the highest address used);
     // MEM_DEPTH sets how much storage is actually allocated. Every address
     // used must be < MEM_DEPTH. Default: 384 KB = 192 K halfwords.
-    parameter MEM_DEPTH = 192 * 1024,
+    parameter MEM_DEPTH = 512 * 1024,
     parameter INIT_FILE = ""     // optional $readmemh preload of the storage
 ) (
     input  wire                   sdram_clk,
@@ -43,8 +43,9 @@ module sdram_model #(
     localparam CMD_REFRESH   = 4'b0001;
     localparam CMD_MRS       = 4'b0000;
 
-    // Storage size: 256 KB = 128 K halfwords. Addresses wrap to 17 bits.
-    localparam ADDR_BITS = 18;   // address-wrap width (covers up to 0x3FFFF)
+    // Storage size covers the full memory map incl. the 320x480 framebuffer at
+    // 0x30000..0x55800. Addresses wrap to 19 bits (up to 0x7FFFF).
+    localparam ADDR_BITS = 19;   // address-wrap width (covers up to 0x7FFFF)
     localparam BEAT_BITS = $clog2(BURST_LEN+1);
 
     // Active row per bank

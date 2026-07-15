@@ -2,7 +2,7 @@
 #include <stdint.h>
 
 #include "sdram_inputs.hex"   // uint16_t sdram_inputs[] : mesh + light (matrix region zeroed)
-#include "sintab.h"           // static const int sintab[1024] : sin(2*pi*k/1024) in Q12.20
+#include "sintab.h"           // quarter-wave sin LUT (Q12.20); full sine via fx_sin
 
 //=========================================================================
 // Per-frame view matrix, computed on the CPU in Q12.20 fixed point and written
@@ -24,11 +24,15 @@ static inline fx fmul(fx a, fx b) { return (fx)(((int64_t)a * b) >> FXSH); }
 // Binary angle: full turn = 2^32, so wrap is free. sin/cos via the 1024-entry
 // full-period LUT with linear interpolation on the low bits.
 static inline fx fx_sin(uint32_t a) {
-    uint32_t k = a >> 22;             // table index 0..1023
-    uint32_t f = a & 0x3FFFFF;        // Q22 fraction between samples
-    fx s0 = sintab[k];
-    fx s1 = sintab[(k + 1) & 1023];
-    return s0 + (fx)(((int64_t)(s1 - s0) * (int32_t)f) >> 22);
+    uint32_t quad = a >> 30;              // quadrant 0..3
+    uint32_t x    = a & 0x3FFFFFFF;       // angle within the quadrant
+    if (quad & 1) x = 0x40000000u - x;    // quadrants 1,3: reflect about pi/2
+    uint32_t idx = x >> 22;               // quarter-table index 0..256
+    uint32_t f   = x & 0x3FFFFF;          // Q22 fraction between samples
+    fx s0 = sinq[idx];
+    fx s1 = sinq[idx + 1];                // guard entries keep this in bounds
+    fx s  = s0 + (fx)(((int64_t)(s1 - s0) * (int32_t)f) >> 22);
+    return (quad & 2) ? -s : s;           // quadrants 2,3: negate
 }
 static inline fx fx_cos(uint32_t a) { return fx_sin(a + 0x40000000u); }
 
@@ -61,16 +65,17 @@ static inline void mat_put(int idx, fx v) {
     mbuf[2 * idx + 1] = (uint16_t)((v >> 16) & 0xFFFF);
 }
 
-// Build matrix for (ax, ay) into mbuf, then DMA it to MATRIX_BASE (3 bursts).
-static void write_matrix(uint32_t ax, uint32_t ay) {
+// Build matrix for (ax, ay) with vertical translation ty (view units) into
+// mbuf, then DMA it to MATRIX_BASE (3 bursts).
+static void write_matrix(uint32_t ax, uint32_t ay, fx ty) {
     fx cx = fx_cos(ax), sx = fx_sin(ax);
     fx cy = fx_cos(ay), sy = fx_sin(ay);
 
-    //  [ cy       0     sy    ]
-    //  [ sx*sy   -cx  -sx*cy  ]   (col 3 = translation = 0)
-    //  [-cx*sy   -sx   cx*cy  ]
+    //  [ cy       0     sy    | 0  ]
+    //  [ sx*sy   -cx  -sx*cy  | ty ]   (col 3 = translation; ty bobs view-Y)
+    //  [-cx*sy   -sx   cx*cy  | 0  ]
     mat_put(0,  cy);            mat_put(1,  0);   mat_put(2,  sy);            mat_put(3,  0);
-    mat_put(4,  fmul(sx, sy));  mat_put(5, -cx);  mat_put(6, -fmul(sx, cy));  mat_put(7,  0);
+    mat_put(4,  fmul(sx, sy));  mat_put(5, -cx);  mat_put(6, -fmul(sx, cy));  mat_put(7,  ty);
     mat_put(8, -fmul(cx, sy));  mat_put(9, -sx);  mat_put(10, fmul(cx, cy));  mat_put(11, 0);
 
     sdram_write_8_x_u16((uint32_t)&mbuf[0],  MATRIX_BASE + 0);
@@ -89,16 +94,20 @@ int main(void) {
     //    write matrix -> signal ready -> wait until frame_count advances.
     const uint32_t AY_INC = 47721859u >> 1;   // 2^32 / 90  (Y: 1 revolution / 90 frames)
     const uint32_t AX_INC = 95443718u >> 1;   // 2^32 / 45  (X: 2 revolutions / 90 frames)
-    uint32_t ax = 0, ay = 0;
+    const uint32_t BOB_INC = 17895697u;       // 2^32 / 240 (up-down cycle every 240 frames)
+    const fx       BOB_AMP = (5 * (1 << FXSH)) / 4;  // 1.25 view units (~100 px at scale 80)
+    uint32_t ax = 0, ay = 0, bob = 0;
     uint32_t last = *FRAME_COUNT;
 
     for (;;) {
-        write_matrix(ax, ay);
+        fx ty = fmul(BOB_AMP, fx_sin(bob));  // slow vertical bob
+        write_matrix(ax, ay, ty);
         *FRAME_COUNT = 1;                    // any write -> matrix_ready
         while (*FRAME_COUNT == last) { }     // wait until this frame is rendered
         last = *FRAME_COUNT;
-        ay += AY_INC;
-        ax += AX_INC;
+        ay  += AY_INC;
+        ax  += AX_INC;
+        bob += BOB_INC;
     }
     return 0;
 }

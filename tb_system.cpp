@@ -2,7 +2,6 @@
 #include <verilated_fst_c.h>
 #include "Vsystem_top.h"
 #include "Vsystem_top_system_top.h"
-#include "Vsystem_top_gpu_top.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -74,7 +73,7 @@ static inline v4 m4mul(const m4 &M, v4 v) {
 static inline fx fxclamp01(fx a) { return a < 0 ? 0 : (a > FX_ONE ? FX_ONE : a); }
 
 
-static const int W = 320, H = 200;
+static const int W = 320, H = 480;
 static const int TW = 64, TH = 64;
 static const int NTX = (W + TW - 1) / TW;
 static const int NTY = (H + TH - 1) / TH;
@@ -89,7 +88,7 @@ static const int SP = 16;
 static const int TRI_BASE     = 0x00000;
 static const int BIN_BASE     = 0x04000;
 static const int BINLIST_BASE = 0x05000;
-static const int FB_BASE      = 0x0A000;
+static const int FB_BASE      = 0x30000;
 
 // Geometry-input regions for the HW geometry pass. Placed above the original
 // 128K-halfword area (the fake SDRAM is now 256K halfwords), so the inputs are
@@ -436,21 +435,25 @@ int main(int argc, char **argv) {
     }
     int sim_time = 0;
 
+    // One clock cycle. Drives display_pix_ce at 1-in-8 (12.5 MHz relative to
+    // the 100 MHz sim clock) so the display's SDRAM demand matches the FPGA
+    // and doesn't monopolise the bus now that it's the highest-priority master.
+    auto tick = [&]() {
+        dut->display_pix_ce = ((sim_time >> 1) & 7) == 0;
+        dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+        dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+    };
+
     // Reset
     dut->rst = 1;
     dut->display_enable = 0;
     dut->display_frame_start = 0;
-    // Drive the display pixel clock-enable at full rate in this standalone
-    // testbench (verified correct; the FIFO produces the same stream).
-    dut->display_pix_ce = 1;
-    dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
-    dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+    tick();
     dut->rst = 0;
 
     // Wait for SDRAM init (100us = 10000 cycles)
     for (int i = 0; i < 11000; i++) {
-        dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
-        dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+        tick();
     }
 
     // Turn on the mocked display controller after SDRAM is initialized.
@@ -466,8 +469,7 @@ int main(int argc, char **argv) {
         dut->start = 1;
         int timeout = 50000000;
         while (!dut->done && timeout-- > 0) {
-            dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
-            dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+            tick();
         }
         dut->start = 0;   // drop start so no new render begins during capture
         if (timeout <= 0) { printf("Frame %03d: TIMEOUT\n", frame); break; }
@@ -486,24 +488,21 @@ int main(int argc, char **argv) {
         int idle_streak = 0;
         int idle_timeout = 10000;
         while (idle_streak < 16 && idle_timeout-- > 0) {
-            dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
-            dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+            tick();
             idle_streak = dut->sdram_idle ? idle_streak + 1 : 0;
         }
         if (idle_timeout <= 0)
             printf("Frame %03d: SDRAM never went idle\n", frame);
 
         dut->display_frame_start = 1;
-        dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
-        dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+        tick();
         dut->display_frame_start = 0;
         dut->display_enable = 1;
 
         int captured = 0;
         int cap_timeout = W * H * 16;
         while (captured < W * H && cap_timeout-- > 0) {
-            dut->clk = 0; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
-            dut->clk = 1; dut->eval(); if (tfp) tfp->dump(sim_time); sim_time++;
+            tick();
             if (dut->display_pix_valid) {
                 uint16_t c = dut->display_pix_data;
                 int y = captured / W;

@@ -19,6 +19,8 @@
 //===========================================================================
 module geom_front #(
     parameter int MEM_AW    = 24,
+    parameter int W         = 320,   // render viewport (projection center = W/2, H/2)
+    parameter int H         = 200,
     parameter int NTX       = 5,
     parameter int NTY       = 4,
     parameter int TILE_W    = 64,
@@ -52,6 +54,7 @@ module geom_front #(
     localparam int BURST     = 8;
     localparam int BSEL      = 3;
     localparam int NUM_TILES = NTX * NTY;
+    localparam int CNT_BURSTS = (NUM_TILES + 7) / 8;   // 8 per-tile counts per burst
     localparam int TIDXW     = $clog2(NUM_TILES);
     localparam int TWSH      = $clog2(TILE_W);
     localparam int THSH      = $clog2(TILE_H);
@@ -62,7 +65,7 @@ module geom_front #(
     logic signed [31:0] g_bbminx, g_bbminy, g_bbmaxx, g_bbmaxy;
     logic [15:0]        g_rec [0:10];
 
-    geom_engine u_geom (
+    geom_engine #(.W(W), .H(H)) u_geom (
         .clk(clk), .rst(rst), .start(g_start),
         .mat(g_mat), .vtx(g_vtx), .nrm(g_nrm), .col(g_col), .light(g_light),
         .done(g_done), .valid(g_valid),
@@ -131,7 +134,7 @@ module geom_front #(
     logic [15:0]        flush_base;
     logic               bin_last;
     logic [15:0]        ft;      // end-flush tile index
-    logic [1:0]         wci;     // count-burst index
+    logic [$clog2(CNT_BURSTS+1)-1:0] wci;     // count-burst index
 
     function automatic signed [31:0] divp(input signed [31:0] x, input int sh);
         return (x >= 0) ? (x >>> sh) : -((-x) >>> sh);
@@ -301,7 +304,7 @@ module geom_front #(
                         burst_addr <= BIN_BASE[MEM_AW-1:0] + (wci << 3);
                         burst_we <= 1; burst_go <= 1;
                     end else if (burst_ack) begin
-                        if (wci == 2) st <= S_DONE;
+                        if (wci == CNT_BURSTS - 1) st <= S_DONE;
                         else wci <= wci + 1'b1;
                     end
                 end

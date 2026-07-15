@@ -1,10 +1,10 @@
 `default_nettype none
 
 // 4-port memory bus arbiter (burst-aware).
-//   m0 = highest priority (GPU rasteriser)
-//   m1 = geometry front-end
-//   m2 = display
-//   m3 = lowest priority (startup SDRAM loader; only active before rendering)
+//   m0 = highest priority (display; must not starve or the screen tears)
+//   m1 = GPU rasteriser
+//   m2 = geometry front-end
+//   m3 = lowest priority (CPU DMA, matrix writes; small + handshake-tolerant)
 //
 // Each access is a fixed-length burst handled end-to-end by sdram_ctrl. The
 // arbiter latches the winning master at accept time and holds the selection

@@ -6,7 +6,7 @@
 
 module system_top #(
     parameter FRAME_W   = 320,
-    parameter FRAME_H   = 200,
+    parameter FRAME_H   = 480,   // full 320x480 panel
     parameter TILE_W    = 64,
     parameter TILE_H    = 64,
     parameter SUBPIXEL  = 4,
@@ -155,6 +155,7 @@ module system_top #(
 
     geom_front #(
         .MEM_AW(MEM_AW),
+        .W(FRAME_W), .H(FRAME_H),
         .NTX((FRAME_W + TILE_W - 1) / TILE_W),
         .NTY((FRAME_H + TILE_H - 1) / TILE_H),
         .TILE_W(TILE_W), .TILE_H(TILE_H),
@@ -377,7 +378,7 @@ module system_top #(
 
     display_ctrl #(
         .MEM_AW(MEM_AW),
-        .FB_BASE(24'h00_A000),
+        .FB_BASE(24'h03_0000),
         .FB_LEN(FRAME_W * FRAME_H)
     ) display (
         .clk(clk),
@@ -401,43 +402,43 @@ module system_top #(
     ) arb (
         .clk(clk),
         .rst(rst),
-        // m0 = GPU (highest priority) // XXX: Should be other way around. Display should have highest priority! If starved the screen will show tearing
-        .m0_addr(gpu_addr),
-        .m0_req(gpu_req),
-        .m0_we(gpu_we),
-        .m0_wr_data(gpu_wr_data),
-        .m0_wr_data_req(gpu_wr_data_req),
-        .m0_rd_data(gpu_rd_data),
-        .m0_rd_valid(gpu_rd_valid),
-        .m0_ready(gpu_ready),
-        // m1 = geometry front-end
-        .m1_addr(geom_addr),
-        .m1_req(geom_req),
-        .m1_we(geom_we),
-        .m1_wr_data(geom_wr_data),
-        .m1_wr_data_req(geom_wr_data_req),
-        .m1_rd_data(geom_rd_data),
-        .m1_rd_valid(geom_rd_valid),
-        .m1_ready(geom_ready),
-        // m2 = startup loader (above display so it isn't starved at boot; it
-        // is idle during rendering, so display keeps its effective priority)
-        .m2_addr(load_addr),
-        .m2_req(load_req),
-        .m2_we(load_we),
-        .m2_wr_data(load_wr_data),
-        .m2_wr_data_req(load_wr_data_req),
-        .m2_rd_data(load_rd_data),
-        .m2_rd_valid(load_rd_valid),
-        .m2_ready(load_ready),
-        // m3 = display (lowest priority)
-        .m3_addr(disp_addr),
-        .m3_req(disp_req),
-        .m3_we(disp_we),
-        .m3_wr_data(disp_wr_data),
-        .m3_wr_data_req(disp_wr_data_req),
-        .m3_rd_data(disp_rd_data),
-        .m3_rd_valid(disp_rd_valid),
-        .m3_ready(disp_ready),
+        // m0 = display (highest priority: must not starve or the screen tears)
+        .m0_addr(disp_addr),
+        .m0_req(disp_req),
+        .m0_we(disp_we),
+        .m0_wr_data(disp_wr_data),
+        .m0_wr_data_req(disp_wr_data_req),
+        .m0_rd_data(disp_rd_data),
+        .m0_rd_valid(disp_rd_valid),
+        .m0_ready(disp_ready),
+        // m1 = GPU rasteriser
+        .m1_addr(gpu_addr),
+        .m1_req(gpu_req),
+        .m1_we(gpu_we),
+        .m1_wr_data(gpu_wr_data),
+        .m1_wr_data_req(gpu_wr_data_req),
+        .m1_rd_data(gpu_rd_data),
+        .m1_rd_valid(gpu_rd_valid),
+        .m1_ready(gpu_ready),
+        // m2 = geometry front-end
+        .m2_addr(geom_addr),
+        .m2_req(geom_req),
+        .m2_we(geom_we),
+        .m2_wr_data(geom_wr_data),
+        .m2_wr_data_req(geom_wr_data_req),
+        .m2_rd_data(geom_rd_data),
+        .m2_rd_valid(geom_rd_valid),
+        .m2_ready(geom_ready),
+        // m3 = CPU DMA (lowest priority: matrix writes are small, and the
+        // CPU handshake tolerates delay -- it spins on frame_count anyway)
+        .m3_addr(load_addr),
+        .m3_req(load_req),
+        .m3_we(load_we),
+        .m3_wr_data(load_wr_data),
+        .m3_wr_data_req(load_wr_data_req),
+        .m3_rd_data(load_rd_data),
+        .m3_rd_valid(load_rd_valid),
+        .m3_ready(load_ready),
         // Slave
         .s_addr(mem_addr),
         .s_req(mem_req),
