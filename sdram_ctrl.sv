@@ -23,7 +23,7 @@ module sdram_ctrl #(
     parameter tRCD        = 2,   // activate to read/write
     parameter tRC         = 7,   // activate to activate (same bank)
     parameter tMRD        = 2,   // mode register set
-    parameter REFRESH_INTERVAL = 780, // 7.8us / 10ns
+    parameter REFRESH_INTERVAL = 760, // 7.8us / 10ns
     // Read-capture latency: total clocks from a READ command to rd_data valid.
     // Default CAS_LATENCY+3 accounts for command launch, the chip's CAS access
     // and the registered DQ input capture. On real hardware the round-trip
@@ -188,9 +188,13 @@ module sdram_ctrl #(
                 rd_valid <= 1;
             end
 
-            // Refresh counter
-            if (state == S_IDLE || state == S_REFRESH)
-                refresh_counter <= (state == S_REFRESH) ? 0 : refresh_counter + 1;
+            // Free-running wall-clock refresh timer: count every cycle (not
+            // only in S_IDLE) so refresh isn't starved during sustained bus
+            // activity. Hold at the interval once due; reset when serviced.
+            if (state == S_REFRESH)
+                refresh_counter <= 0;
+            else if (refresh_counter < REFRESH_INTERVAL)
+                refresh_counter <= refresh_counter + 1;
 
             case (state)
                 S_INIT_WAIT: begin

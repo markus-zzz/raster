@@ -36,20 +36,20 @@ module geom_engine #(
     output logic signed [31:0]      bbminx, bbminy, bbmaxx, bbmaxy,
     output logic [15:0]             rec   [0:10]
 );
-    localparam int SH = 20;
+    localparam int SH = 12;
     localparam signed [31:0] FX_ONE = 32'sd1 <<< SH;
-    localparam signed [31:0] C_020  = 32'sd209715;   // fxf(0.2)
-    localparam signed [31:0] C_080  = 32'sd838861;   // fxf(0.8)
+    localparam signed [31:0] C_020  = 32'sd819;      // fxf(0.2) in Q20.12
+    localparam signed [31:0] C_080  = 32'sd3277;     // fxf(0.8) in Q20.12
     localparam signed [31:0] OFF_X  = (W/2) <<< SH;  // fxi(W/2)
     localparam signed [31:0] OFF_Y  = (H/2) <<< SH;  // fxi(H/2)
     localparam signed [31:0] FXF275 = 32'sd275 <<< SH;
 
-    // Q12.20 -> Q11.5 (real*32), round half away from zero.
+    // Q20.12 -> Q11.5 (real*32), round half away from zero.
     function automatic signed [15:0] to_q11_5(input signed [31:0] a);
         logic signed [63:0] v;
         v = $signed({{32{a[31]}}, a}) * 64'sd32;
-        v = v + (a >= 0 ? 64'sd524288 : -64'sd524288);
-        return v[35:20];
+        v = v + (a >= 0 ? 64'sd2048 : -64'sd2048);
+        return v[SH+15:SH];
     endfunction
 
     //--------------------------------------------------------------------
@@ -59,7 +59,7 @@ module geom_engine #(
     logic               dot_go, dot_done;
     logic signed [31:0] da0,da1,da2,da3, db0,db1,db2,db3;
     logic signed [31:0] dot_res;
-    dot4 u_dot (.clk(clk), .start(dot_go),
+    dot4 #(.SH(SH)) u_dot (.clk(clk), .start(dot_go),
                 .a0(da0),.a1(da1),.a2(da2),.a3(da3),
                 .b0(db0),.b1(db1),.b2(db2),.b3(db3),
                 .result(dot_res), .done(dot_done));
@@ -83,7 +83,7 @@ module geom_engine #(
     //--------------------------------------------------------------------
     typedef enum logic [5:0] {
         S_IDLE, S_SMUL, S_DOT,
-        S_XF_ISS, S_XF_STO, S_CULL,
+        S_XF_ISS, S_CULL,
         S_LDOT_STO, S_INT_STO,
         S_COL_A, S_COL_B, S_COL_C,
         S_PROJ_X, S_PROJ_XS, S_PROJ_YS, S_PROJ_ZS,
@@ -105,7 +105,8 @@ module geom_engine #(
     logic signed [63:0] area, nxg, nyg, pa, mres;
     logic signed [31:0] dres;
     logic               cull;
-    logic [3:0]         xfi;      // transform op index 0..11
+    logic [3:0]         xfi;      // transform issue index 0..12
+    logic [3:0]         xf_col;   // transform collect index 0..12
     logic [1:0]         ci, vi;   // colour channel / vertex index
 
     function automatic signed [31:0] clamp01(input signed [31:0] a);
@@ -115,7 +116,7 @@ module geom_engine #(
     endfunction
 
     // fmul result of the scalar multiply (Q12.20)
-    wire signed [31:0] smul_fm = mres[51:20];   // (a*b) >>> 20
+    wire signed [31:0] smul_fm = mres[SH+31:SH];   // (a*b) >>> SH
 
     integer k;
     always_ff @(posedge clk) begin
@@ -129,36 +130,41 @@ module geom_engine #(
                     for (k=0;k<12;k++) m[k] <= mat[k];
                     for (k=0;k<9;k++)  v[k] <= vtx[k];
                     for (k=0;k<3;k++) begin nn[k]<=nrm[k]; cc[k]<=col[k]; L[k]<=light[k]; end
-                    xfi <= 0; st <= S_XF_ISS;
+                    xfi <= 0; xf_col <= 0; st <= S_XF_ISS;
                 end
 
                 // generic waits -------------------------------------------
                 S_SMUL: if (smul_done) begin mres <= smul_p; st <= ret_st; end
                 S_DOT:  if (dot_done)  begin dres <= dot_res; st <= ret_st; end
 
-                // transform: 12 dot4 ops -> vv[0..8], nvec[0..2] ----------
+                // transform: 12 pipelined dot4 ops -> vv[0..8], nvec[0..2].
+                // dot4 accepts a new op every cycle and returns results in
+                // order 3 cycles later, so we issue all 12 back-to-back and
+                // collect them as they stream out (~15 cycles vs ~60 serial).
                 S_XF_ISS: begin
-                    // xfi: 0-2 v0 rows0-2, 3-5 v1, 6-8 v2, 9-11 normal
                     logic [1:0] vecsel; logic [1:0] row;
-                    vecsel = xfi / 3;        // 0,1,2 verts ; 3 normal
-                    row    = xfi % 3;
-                    da0 <= m[row*4+0]; da1 <= m[row*4+1];
-                    da2 <= m[row*4+2]; da3 <= m[row*4+3];
-                    if (vecsel == 3) begin       // normal (w=0)
-                        db0 <= nn[0]; db1 <= nn[1]; db2 <= nn[2]; db3 <= 0;
-                    end else begin               // vertex (w=1)
-                        db0 <= v[vecsel*3+0]; db1 <= v[vecsel*3+1];
-                        db2 <= v[vecsel*3+2]; db3 <= FX_ONE;
+                    // ---- issue one op per cycle ----
+                    if (xfi < 4'd12) begin
+                        vecsel = xfi / 3;        // 0,1,2 verts ; 3 normal
+                        row    = xfi % 3;
+                        da0 <= m[row*4+0]; da1 <= m[row*4+1];
+                        da2 <= m[row*4+2]; da3 <= m[row*4+3];
+                        if (vecsel == 3) begin       // normal (w=0)
+                            db0 <= nn[0]; db1 <= nn[1]; db2 <= nn[2]; db3 <= 0;
+                        end else begin               // vertex (w=1)
+                            db0 <= v[vecsel*3+0]; db1 <= v[vecsel*3+1];
+                            db2 <= v[vecsel*3+2]; db3 <= FX_ONE;
+                        end
+                        dot_go <= 1;
+                        xfi <= xfi + 1'b1;
                     end
-                    dot_go <= 1; ret_st <= S_XF_STO; st <= S_DOT;
-                end
-                S_XF_STO: begin
-                    logic [1:0] vecsel; logic [1:0] row;
-                    vecsel = xfi / 3; row = xfi % 3;
-                    if (vecsel == 3) nvec[row] <= dres;
-                    else             vv[vecsel*3+row] <= dres;
-                    if (xfi == 11) st <= S_CULL;
-                    else begin xfi <= xfi + 1'b1; st <= S_XF_ISS; end
+                    // ---- collect results in issue order ----
+                    if (dot_done) begin
+                        if (xf_col < 4'd9) vv[xf_col]        <= dot_res; // vv[0..8]
+                        else               nvec[xf_col - 4'd9] <= dot_res; // nvec[0..2]
+                        if (xf_col == 4'd11) st <= S_CULL;
+                        else xf_col <= xf_col + 1'b1;
+                    end
                 end
 
                 // back-face cull -----------------------------------------
@@ -197,7 +203,7 @@ module geom_engine #(
                 end
                 S_COL_C: begin
                     logic [7:0] chan;
-                    chan = mres[27:20];          // (cr*255) >>> 20
+                    chan = mres[SH+7:SH];        // (cr*255) >>> SH
                     if (ci == 0) rr <= chan;
                     else if (ci == 1) gg <= chan;
                     else bb <= chan;

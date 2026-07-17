@@ -16,8 +16,8 @@
 // translation column = 0 -- the exact layout the loader used for a baked matrix.
 //=========================================================================
 
-#define FXSH 20
-typedef int32_t fx;   // Q12.20
+#define FXSH 12
+typedef int32_t fx;   // Q20.12
 
 static inline fx fmul(fx a, fx b) { return (fx)(((int64_t)a * b) >> FXSH); }
 

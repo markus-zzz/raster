@@ -31,7 +31,7 @@
 // (as a 32x32 hardware multiplier would) and truncate back to 32 bits.
 //=========================================================================
 typedef int32_t fx;                       // Q12.20 (32-bit)
-static const int FXSH = 20;
+static const int FXSH = 12;
 static const fx  FX_ONE = 1 << FXSH;
 
 static inline fx  fxf(double d) { return (fx)llround(d * (double)(1 << FXSH)); }
