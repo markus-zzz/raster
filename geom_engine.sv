@@ -72,11 +72,11 @@ module geom_engine #(
                  .p(smul_p), .done(smul_done));
 
     // sequential signed divider (64/64 -> low 32, trunc toward zero)
-    logic               div_go, div_done;
-    logic signed [63:0] div_num, div_den;
-    logic signed [31:0] div_quo;
-    divs u_div (.clk(clk), .rst(rst), .start(div_go),
-                .num(div_num), .den(div_den), .done(div_done), .quo(div_quo));
+    logic               rd_go, rd_done;
+    logic signed [31:0] rd_quo0, rd_quo1;
+    recipdiv u_rd (.clk(clk), .rst(rst), .start(rd_go),
+                   .den(area), .num0(nxg), .num1(nyg),
+                   .done(rd_done), .quo0(rd_quo0), .quo1(rd_quo1));
 
     //--------------------------------------------------------------------
     // State
@@ -89,7 +89,7 @@ module geom_engine #(
         S_PROJ_X, S_PROJ_XS, S_PROJ_YS, S_PROJ_ZS,
         S_SWAP, S_AREA_A, S_AREA_B, S_AREA_C,
         S_NX_A, S_NX_B, S_NX_C, S_NY_A, S_NY_B, S_NY_C,
-        S_DIVX, S_DIVX_W, S_DIVY, S_DIVY_W, S_IZ00_A, S_IZ00_B, S_IZ00_C, S_FIN
+        S_DIV, S_DIV_W, S_IZ00_A, S_IZ00_B, S_IZ00_C, S_FIN
     } st_t;
     st_t st, ret_st;
 
@@ -122,9 +122,9 @@ module geom_engine #(
     always_ff @(posedge clk) begin
         if (rst) begin
             st <= S_IDLE; done <= 0; valid <= 0;
-            dot_go <= 0; smul_go <= 0; div_go <= 0;
+            dot_go <= 0; smul_go <= 0; rd_go <= 0;
         end else begin
-            done <= 0; dot_go <= 0; smul_go <= 0; div_go <= 0;
+            done <= 0; dot_go <= 0; smul_go <= 0; rd_go <= 0;
             case (st)
                 S_IDLE: if (start) begin
                     for (k=0;k<12;k++) m[k] <= mat[k];
@@ -294,13 +294,14 @@ module geom_engine #(
                     smul_a <= diz1; smul_b <= e2x;
                     smul_go <= 1; ret_st <= S_NY_C; st <= S_SMUL;
                 end
-                S_NY_C: begin nyg <= pa - mres; st <= S_DIVX; end
+                S_NY_C: begin nyg <= pa - mres; st <= S_DIV; end
 
-                // divides -------------------------------------------------
-                S_DIVX:   begin div_num <= nxg; div_den <= area; div_go <= 1; st <= S_DIVX_W; end
-                S_DIVX_W: if (div_done) begin diz_dx <= div_quo; st <= S_DIVY; end
-                S_DIVY:   begin div_num <= nyg; div_den <= area; div_go <= 1; st <= S_DIVY_W; end
-                S_DIVY_W: if (div_done) begin diz_dy <= div_quo; st <= S_IZ00_A; end
+                // reciprocal-multiply divide: diz_dx=nxg/area, diz_dy=nyg/area
+                // (shared denominator, ~8 cycles vs two 64-cycle divides)
+                S_DIV:   begin rd_go <= 1; st <= S_DIV_W; end
+                S_DIV_W: if (rd_done) begin
+                             diz_dx <= rd_quo0; diz_dy <= rd_quo1; st <= S_IZ00_A;
+                         end
 
                 // iz_at_00 = izp0 - diz_dx*p0x - diz_dy*p0y ---------------
                 S_IZ00_A: begin
@@ -394,46 +395,97 @@ endmodule
 
 
 //===========================================================================
-// Sequential signed divider (trunc toward zero). 64-bit long division; the
-// caller uses the low 32 bits of the quotient.
+// recipdiv: q0 = num0/den, q1 = num1/den (truncate toward zero), sharing one
+// reciprocal r = 1/|den|. Normalized Newton-Raphson: the denominator mantissa
+// d is normalized to [1,2) (Q1.23); r = 1/d (Q.23) comes from a 256-entry seed
+// LUT refined by two NR iterations (r <- r*(2 - d*r)); then
+//   q = num * r >> (msb(|den|) + 23).
+// ~8 cycles, replacing two 64-cycle iterative divides that shared den.
 //===========================================================================
-module divs (
-    input  wire                clk,
-    input  wire                rst,
-    input  wire                start,
-    input  wire signed [63:0]  num,
-    input  wire signed [63:0]  den,
+module recipdiv (
+    input  wire                clk, rst, start,
+    input  wire signed [63:0]  den, num0, num1,
     output logic               done,
-    output logic signed [31:0] quo
+    output logic signed [31:0] quo0, quo1
 );
-    logic busy;
-    logic [6:0] cnt;
-    logic [63:0] an, ad, rem, q;
-    logic        neg;
+    localparam int FR = 23;
+    (* ram_style = "block" *) logic [23:0] seed_lut [0:255];
+    initial $readmemh("recip_seed.hex", seed_lut);
+
+    typedef enum logic [3:0] {
+        R_IDLE, R_NORM, R_SEED,
+        R_MUL1, R_SUB1, R_MUL2,     // Newton iteration 1 (one multiply per state)
+        R_MUL3, R_SUB2, R_MUL4,     // Newton iteration 2
+        R_PMUL, R_SHIFT, R_DONE
+    } rs_t;
+    rs_t          rs;
+    logic         sgn0, sgn1, dzero;
+    logic [31:0]  a;              // |den|
+    logic [5:0]   E;              // msb index of a
+    logic [24:0]  Dm;             // normalized mantissa d, Q1.23
+    logic [24:0]  r, t;           // reciprocal 1/d and (2 - d*r), Q.23
+    logic [49:0]  pr;             // d*r product, Q2.46
+    logic [63:0]  n0, n1;         // |num0|, |num1|
+    logic [95:0]  p0, p1;         // num*r products
+
+    function automatic [5:0] msb_idx(input [31:0] x);
+        msb_idx = 6'd0;
+        for (int i = 0; i < 32; i++) if (x[i]) msb_idx = i[5:0];
+    endfunction
 
     always_ff @(posedge clk) begin
-        if (rst) begin
-            busy <= 0; done <= 0;
-        end else begin
+        if (rst) begin rs <= R_IDLE; done <= 0; end
+        else begin
             done <= 0;
-            if (start && !busy) begin
-                an   <= num[63] ? (~num + 1'b1) : num;
-                ad   <= den[63] ? (~den + 1'b1) : den;
-                neg  <= num[63] ^ den[63];
-                rem  <= 0; q <= 0; cnt <= 0; busy <= 1;
-            end else if (busy) begin
-                logic [63:0] r2, qn;
-                r2 = (rem <<< 1) | {63'b0, an[63]};
-                an <= an <<< 1;
-                if (r2 >= ad) begin rem <= r2 - ad; qn = (q <<< 1) | 64'd1; end
-                else          begin rem <= r2;      qn = q <<< 1;          end
-                q   <= qn;
-                cnt <= cnt + 1'b1;
-                if (cnt == 7'd63) begin
-                    busy <= 0; done <= 1;
-                    quo  <= neg ? (~qn[31:0] + 1'b1) : qn[31:0];
+            case (rs)
+                R_IDLE: if (start) begin
+                    sgn0  <= den[63] ^ num0[63];
+                    sgn1  <= den[63] ^ num1[63];
+                    dzero <= (den == 0);
+                    a  <= den[63]  ? (~den[31:0] + 1'b1) : den[31:0];
+                    n0 <= num0[63] ? (~num0 + 1'b1) : num0;
+                    n1 <= num1[63] ? (~num1 + 1'b1) : num1;
+                    rs <= R_NORM;
                 end
-            end
+                R_NORM: begin
+                    logic [5:0] e; e = msb_idx(a);
+                    E  <= e;
+                    Dm <= (e <= FR) ? (a << (FR - e)) : (a >> (e - FR));
+                    rs <= R_SEED;
+                end
+                R_SEED: begin
+                    r  <= {1'b0, seed_lut[Dm[FR-1 -: 8]]};   // top 8 fraction bits
+                    rs <= R_MUL1;
+                end
+                // Newton iteration: r <- r*(2 - d*r), one multiply per state.
+                R_MUL1: begin pr <= Dm * r;                    rs <= R_SUB1; end
+                R_SUB1: begin t  <= (25'd1 << (FR+1)) - {1'b0, pr[FR +: 24]}; rs <= R_MUL2; end
+                R_MUL2: begin r  <= (r * t) >> FR;             rs <= R_MUL3; end
+                R_MUL3: begin pr <= Dm * r;                    rs <= R_SUB2; end
+                R_SUB2: begin t  <= (25'd1 << (FR+1)) - {1'b0, pr[FR +: 24]}; rs <= R_MUL4; end
+                R_MUL4: begin r  <= (r * t) >> FR;             rs <= R_PMUL; end
+                // final: p = num*r (two parallel multiplies), then shift+sign
+                R_PMUL: begin
+                    p0 <= {32'b0, n0} * r;
+                    p1 <= {32'b0, n1} * r;
+                    rs <= R_SHIFT;
+                end
+                R_SHIFT: begin
+                    logic [6:0]  shamt;
+                    logic [31:0] q0m, q1m;
+                    shamt = E + FR[6:0];
+                    q0m = p0 >> shamt;
+                    q1m = p1 >> shamt;
+                    if (dzero) begin quo0 <= 0; quo1 <= 0; end
+                    else begin
+                        quo0 <= sgn0 ? -$signed(q0m) : $signed(q0m);
+                        quo1 <= sgn1 ? -$signed(q1m) : $signed(q1m);
+                    end
+                    done <= 1; rs <= R_DONE;
+                end
+                R_DONE: rs <= R_IDLE;
+                default: rs <= R_IDLE;
+            endcase
         end
     end
 endmodule

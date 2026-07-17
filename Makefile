@@ -13,9 +13,13 @@ VFLAGS = --cc --exe --build -j 0 --trace-fst -Wno-fatal \
 
 all: run
 
+# Reciprocal-divider seed LUT (read via $readmemh by geom_engine at runtime).
+recip_seed.hex: gen_recipseed.py
+	python3 gen_recipseed.py
+
 # 1) Verilate + build the sim executable (does not need the hex files yet;
 #    the CPU ROM is loaded from bios.vh at sim runtime via $readmemh).
-system: $(SRCS)
+system: $(SRCS) recip_seed.hex
 	$(VERILATOR) $(VFLAGS) -CFLAGS '-std=c++20 -O3' \
 		$(SRCS) -o Vsystem_top
 	cp obj_dir/Vsystem_top $@
@@ -37,6 +41,6 @@ run: system bios.vh
 	./system
 
 clean:
-	rm -f system frame_*.ppm sdram_inputs.hex bios.vh
+	rm -f system frame_*.ppm sdram_inputs.hex bios.vh recip_seed.hex
 	rm -rf obj_dir
 	-$(MAKE) -C fw clean
