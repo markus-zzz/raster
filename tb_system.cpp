@@ -348,10 +348,12 @@ void finalize_bins(auto &mem) {
 // hardware loader (sdram_loader), in both simulation and on the FPGA.
 static const int INPUT_BASE  = 0x20000;   // = MATRIX_BASE (halfwords)
 static const int INPUT_WORDS = 23680;     // 0x20000..0x25C80, multiple of 8
-void dump_inputs_hex(const char *fn, const std::vector<uint16_t> &rom) {
+void dump_inputs_hex(const char *fn, const std::vector<uint16_t> &rom, int nfaces) {
     FILE *f = fopen(fn, "w");
     if (!f) { printf("ERROR: cannot open %s for write\n", fn); return; }
-    fprintf(f, "#include <stdint.h>\nconst uint16_t sdram_inputs[] = {\n");
+    fprintf(f, "#include <stdint.h>\n");
+    fprintf(f, "#define SDRAM_NUM_FACES %d\n", nfaces);
+    fprintf(f, "const uint16_t sdram_inputs[] = {\n");
     for (int i = 0; i < INPUT_WORDS; i++)
         fprintf(f, "  0x%04X,\n", rom[i]);
     fprintf(f, "};");
@@ -418,7 +420,7 @@ int main(int argc, char **argv) {
             w32(b+11, (uint32_t)faces[f].color.y);
             w32(b+13, (uint32_t)faces[f].color.z);
         }
-        dump_inputs_hex("sdram_inputs.hex", rom);
+        dump_inputs_hex("sdram_inputs.hex", rom, (int)faces.size());
     }
 
     // In --emit-inputs mode we only (re)generate the header the firmware needs;

@@ -3,19 +3,29 @@
 //===========================================================================
 // geom_front (burst master): geometry pass on the shared SDRAM bus.
 //
-// For every face it burst-reads the face record + the 3 vertices, runs
-// geom_engine, burst-writes the 16-word triangle record (2 bursts), and bins
-// the triangle into per-tile buckets. Bin entries are accumulated 8 at a time
-// per tile and flushed as aligned bursts (no read-modify-write). Finally it
-// writes the per-tile counts. Produces the TRI/BINLIST/BIN layout gpu_top reads.
+// Walks a null-terminated linked list of descriptors starting at desc_head.
+// Each descriptor is 16 halfwords (2 aligned bursts):
+//   hw 0-1 : command       (0 = SET_OUTPUT, 1 = OBJECT)
+//   hw 2-3 : next_desc      (halfword address; 0 => end of list)
+//   SET_OUTPUT payload:                 OBJECT payload:
+//     hw 4-5 : tri_base                   hw 4-5 : in_vertex_base
+//     hw 6-7 : binlist_base               hw 6-7 : in_faces_base
+//     hw 8-9 : bin_base                   hw 8-9 : in_matrix_base
+//     hw10-11: light_x (neg dir)          hw10   : in_nbr_faces
+//     hw12-13: light_y                    hw11-15: pad
+//     hw14-15: light_z
 //
-// Burst master interface identical to gpu_top's (one 8-beat burst per req;
-// 8-aligned addresses). Input layout (halfword addrs; 32-bit = lo,hi):
-//   MATRIX_BASE : 12 words row-major 3x4, 2 hw each              (24 hw, 3 bursts)
-//   LIGHT_BASE  : 3 words (negated light dir)                     (6 hw, 1 burst)
-//   VTX_BASE    : vertex i at +i*8 : x,y,z (2 hw each) + 2 pad    (1 burst)
-//   FACE_BASE   : face f at +f*16 : idx0,idx1,idx2, normal xyz,
-//                 colour xyz (see decode)                          (2 bursts)
+// SET_OUTPUT delimits a frame: it latches the output bases + light and, if a
+// region was already active, first finalizes it (flush partial bins + write
+// counts) to the *old* bases. OBJECT transforms/bins one mesh, accumulating
+// into the shared on-chip per-tile buckets (no reset, no finalize). At the end
+// of the list the current region is finalized. So one list can carry several
+// frames' worth of geometry. The list must start with a SET_OUTPUT.
+//
+// Per face it burst-reads the face record + 3 vertices, runs geom_engine,
+// burst-writes the 16-word triangle record (2 bursts), and bins the triangle
+// into per-tile buckets flushed 8 at a time as aligned bursts. Produces the
+// TRI/BINLIST/BIN layout gpu_top reads.
 //===========================================================================
 module geom_front #(
     parameter int MEM_AW    = 24,
@@ -25,21 +35,12 @@ module geom_front #(
     parameter int NTY       = 4,
     parameter int TILE_W    = 64,
     parameter int TILE_H    = 64,
-    parameter int MAX_FACES_PER_TILE = 1024,
-    parameter int MATRIX_STRIDE = 24,   // halfwords per matrix (12 words x 2)
-    parameter int MATRIX_BASE = 0,
-    parameter int LIGHT_BASE  = 0,
-    parameter int VTX_BASE    = 0,
-    parameter int FACE_BASE   = 0,
-    parameter int TRI_BASE    = 0,
-    parameter int BIN_BASE    = 0,
-    parameter int BINLIST_BASE= 0
+    parameter int MAX_FACES_PER_TILE = 1024
 ) (
     input  wire                 clk,
     input  wire                 rst,
     input  wire                 start,
-    input  wire  [15:0]         nfaces,
-    input  wire  [15:0]         mat_index,   // which matrix to use this frame
+    input  wire  [MEM_AW-1:0]   desc_head,   // head of the descriptor list
     output logic                done,
     // burst master interface
     output logic [MEM_AW-1:0]   mem_addr,
@@ -58,6 +59,9 @@ module geom_front #(
     localparam int TIDXW     = $clog2(NUM_TILES);
     localparam int TWSH      = $clog2(TILE_W);
     localparam int THSH      = $clog2(TILE_H);
+
+    localparam [15:0] CMD_SET = 16'd0;   // set output bases + light (frame delimiter)
+    localparam [15:0] CMD_OBJ = 16'd1;   // transform + bin one mesh
 
     // ---------------- geom_engine ----------------
     logic               g_start, g_done, g_valid;
@@ -116,11 +120,20 @@ module geom_front #(
 
     // ---------------- high-level FSM ----------------
     typedef enum logic [4:0] {
-        S_IDLE, S_MAT, S_LIGHT, S_FACE_HEAD, S_FACE, S_FACE_DEC, S_VTX,
-        S_GEOM_W, S_WREC, S_BINP, S_BIN, S_BINFLUSH,
-        S_FLUSHT, S_WCNT, S_DONE
+        S_IDLE, S_DESC0, S_DESC1, S_DECODE, S_SETAPPLY,
+        S_MAT, S_FACE_HEAD, S_FACE, S_FACE_DEC, S_VTX, S_GEOM_W, S_WREC,
+        S_BINP, S_BIN, S_BINFLUSH, S_ADVANCE, S_FLUSHT, S_WCNT, S_DONE
     } st_t;
     st_t st;
+
+    // descriptor walk
+    logic [MEM_AW-1:0] desc_ptr, next_desc_r;
+    logic [MEM_AW-1:0] tri_base_r, binlist_base_r, bin_base_r;   // current output region
+    logic [MEM_AW-1:0] ovtx, ofaces, omatrix;                    // current object inputs
+    logic [15:0]       onfaces;
+    logic [15:0]       dbuf [0:15];    // descriptor buffer (2 bursts)
+    logic              region_active;  // an output region has been set up
+    logic              fin_done;       // finalize target: 1=>S_DONE, 0=>S_SETAPPLY
 
     logic [15:0] fcnt, tri_id, gidx [0:2];
     logic [15:0] fblk [0:15];
@@ -148,43 +161,82 @@ module geom_front #(
     always_ff @(posedge clk) begin
         if (rst) begin
             st <= S_IDLE; done <= 0; g_start <= 0; burst_go <= 0; burst_we <= 0;
+            region_active <= 0;
         end else begin
             g_start <= 0; burst_go <= 0; done <= 0;
             case (st)
-                S_IDLE: if (start) begin mbi <= 0; st <= S_MAT; end
+                S_IDLE: if (start) begin
+                    desc_ptr <= desc_head; region_active <= 0; st <= S_DESC0;
+                end
 
-                // ---- read matrix (3 bursts) ----
+                // ---- fetch descriptor (2 bursts into dbuf) ----
+                S_DESC0: begin
+                    if (eng_idle) begin
+                        burst_addr <= desc_ptr; burst_we <= 0; burst_go <= 1;
+                    end else if (burst_ack) begin
+                        for (k=0;k<8;k++) dbuf[k] <= rdbuf[k];
+                        st <= S_DESC1;
+                    end
+                end
+                S_DESC1: begin
+                    if (eng_idle) begin
+                        burst_addr <= desc_ptr + MEM_AW'(BURST); burst_we <= 0; burst_go <= 1;
+                    end else if (burst_ack) begin
+                        for (k=0;k<8;k++) dbuf[8+k] <= rdbuf[k];
+                        st <= S_DECODE;
+                    end
+                end
+                // decode command and dispatch
+                S_DECODE: begin
+                    next_desc_r <= MEM_AW'({dbuf[3], dbuf[2]});
+                    if (dbuf[0] == CMD_SET) begin
+                        // SET_OUTPUT: finalize the previous region first (if any),
+                        // then apply the new bases/light (dbuf is preserved meanwhile).
+                        if (region_active) begin fin_done <= 0; ft <= 0; st <= S_FLUSHT; end
+                        else st <= S_SETAPPLY;
+                    end else begin
+                        // OBJECT
+                        ovtx    <= MEM_AW'({dbuf[5], dbuf[4]});
+                        ofaces  <= MEM_AW'({dbuf[7], dbuf[6]});
+                        omatrix <= MEM_AW'({dbuf[9], dbuf[8]});
+                        onfaces <= dbuf[10];
+                        fcnt <= 0; mbi <= 0; st <= S_MAT;
+                    end
+                end
+                // apply latched SET_OUTPUT: new bases + light, reset accumulators
+                S_SETAPPLY: begin
+                    tri_base_r     <= MEM_AW'({dbuf[5],  dbuf[4]});
+                    binlist_base_r <= MEM_AW'({dbuf[7],  dbuf[6]});
+                    bin_base_r     <= MEM_AW'({dbuf[9],  dbuf[8]});
+                    g_light[0]     <= $signed({dbuf[11], dbuf[10]});
+                    g_light[1]     <= $signed({dbuf[13], dbuf[12]});
+                    g_light[2]     <= $signed({dbuf[15], dbuf[14]});
+                    for (k=0;k<NUM_TILES;k++) tcount[k] <= 0;
+                    tri_id <= 0; region_active <= 1;
+                    st <= S_ADVANCE;
+                end
+
+                // ---- read matrix (3 bursts) from the object's matrix base ----
                 S_MAT: begin
                     if (eng_idle) begin
-                        burst_addr <= MATRIX_BASE[MEM_AW-1:0]
-                                    + MEM_AW'(mat_index) * MATRIX_STRIDE + (mbi << 3);
+                        burst_addr <= omatrix + (mbi << 3);
                         burst_we <= 0; burst_go <= 1;
                     end else if (burst_ack) begin
                         for (k=0;k<4;k++)
                             g_mat[mbi*4+k] <= $signed({rdbuf[2*k+1], rdbuf[2*k]});
-                        if (mbi == 2) begin st <= S_LIGHT; end
+                        if (mbi == 2) st <= S_FACE_HEAD;
                         else mbi <= mbi + 1'b1;
-                    end
-                end
-                // ---- read light (1 burst) ----
-                S_LIGHT: begin
-                    if (eng_idle) begin
-                        burst_addr <= LIGHT_BASE[MEM_AW-1:0]; burst_we <= 0; burst_go <= 1;
-                    end else if (burst_ack) begin
-                        for (k=0;k<3;k++) g_light[k] <= $signed({rdbuf[2*k+1], rdbuf[2*k]});
-                        for (k=0;k<NUM_TILES;k++) tcount[k] <= 0;
-                        fcnt <= 0; tri_id <= 0; st <= S_FACE_HEAD;
                     end
                 end
 
                 S_FACE_HEAD: begin
-                    if (fcnt >= nfaces) begin ft <= 0; st <= S_FLUSHT; end
+                    if (fcnt >= onfaces) st <= S_ADVANCE;
                     else begin fbi <= 0; st <= S_FACE; end
                 end
                 // ---- read face record (2 bursts) ----
                 S_FACE: begin
                     if (eng_idle) begin
-                        burst_addr <= FACE_BASE[MEM_AW-1:0] + (fcnt << 4) + (fbi << 3);
+                        burst_addr <= ofaces + (fcnt << 4) + (fbi << 3);
                         burst_we <= 0; burst_go <= 1;
                     end else if (burst_ack) begin
                         for (k=0;k<8;k++) fblk[fbi*8+k] <= rdbuf[k];
@@ -206,7 +258,7 @@ module geom_front #(
                 // ---- read vertices (1 burst each) ----
                 S_VTX: begin
                     if (eng_idle) begin
-                        burst_addr <= VTX_BASE[MEM_AW-1:0] + (gidx[vi] << 3);
+                        burst_addr <= ovtx + (gidx[vi] << 3);
                         burst_we <= 0; burst_go <= 1;
                     end else if (burst_ack) begin
                         g_vtx[vi*3+0] <= $signed({rdbuf[1], rdbuf[0]});
@@ -230,7 +282,7 @@ module geom_front #(
                             wbuf[0] <= g_rec[8]; wbuf[1] <= g_rec[9]; wbuf[2] <= g_rec[10];
                             for (k=3;k<8;k++) wbuf[k] <= 16'b0;
                         end
-                        burst_addr <= TRI_BASE[MEM_AW-1:0] + (tri_id << 4) + (recbi ? BURST : 0);
+                        burst_addr <= tri_base_r + (tri_id << 4) + (recbi ? BURST : 0);
                         burst_we <= 1; burst_go <= 1;
                     end else if (burst_ack) begin
                         if (recbi) st <= S_BINP;
@@ -270,7 +322,7 @@ module geom_front #(
                 S_BINFLUSH: begin
                     if (eng_idle) begin
                         for (k=0;k<8;k++) wbuf[k] <= tacc[flush_tile*BURST + k];
-                        burst_addr <= BINLIST_BASE[MEM_AW-1:0]
+                        burst_addr <= binlist_base_r
                                     + (flush_tile * MAX_FACES_PER_TILE) + {2'b0, flush_base};
                         burst_we <= 1; burst_go <= 1;
                     end else if (burst_ack) begin
@@ -280,14 +332,24 @@ module geom_front #(
                     end
                 end
 
-                // ---- end: flush partial per-tile groups ----
+                // ---- advance to next descriptor (or finalize at end of list) ----
+                S_ADVANCE: begin
+                    if (next_desc_r == 0) begin
+                        if (region_active) begin fin_done <= 1; ft <= 0; st <= S_FLUSHT; end
+                        else st <= S_DONE;
+                    end else begin
+                        desc_ptr <= next_desc_r; st <= S_DESC0;
+                    end
+                end
+
+                // ---- finalize region: flush partial per-tile groups ----
                 S_FLUSHT: begin
                     if (ft >= NUM_TILES) begin wci <= 0; st <= S_WCNT; end
                     else if ((tcount[ft[TIDXW-1:0]] & 16'd7) == 0) begin
                         ft <= ft + 1'b1;   // nothing partial to flush
                     end else if (eng_idle) begin
                         for (k=0;k<8;k++) wbuf[k] <= tacc[ft[TIDXW-1:0]*BURST + k];
-                        burst_addr <= BINLIST_BASE[MEM_AW-1:0]
+                        burst_addr <= binlist_base_r
                                     + (ft[TIDXW-1:0] * MAX_FACES_PER_TILE)
                                     + {2'b0, (tcount[ft[TIDXW-1:0]] & ~16'd7)};
                         burst_we <= 1; burst_go <= 1;
@@ -296,15 +358,15 @@ module geom_front #(
                     end
                 end
 
-                // ---- write per-tile counts (3 bursts = 24 words) ----
+                // ---- write per-tile counts, then continue or finish ----
                 S_WCNT: begin
                     if (eng_idle) begin
                         for (k=0;k<8;k++)
                             wbuf[k] <= ((wci*8+k) < NUM_TILES) ? tcount[(wci*8+k) % NUM_TILES] : 16'b0;
-                        burst_addr <= BIN_BASE[MEM_AW-1:0] + (wci << 3);
+                        burst_addr <= bin_base_r + (wci << 3);
                         burst_we <= 1; burst_go <= 1;
                     end else if (burst_ack) begin
-                        if (wci == CNT_BURSTS - 1) st <= S_DONE;
+                        if (wci == CNT_BURSTS - 1) st <= fin_done ? S_DONE : S_SETAPPLY;
                         else wci <= wci + 1'b1;
                     end
                 end

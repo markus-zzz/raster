@@ -46,3 +46,15 @@ $ ffmpeg -framerate 10 -i frame_%03d.ppm -c:v libx264 -crf 25 -vf "format=yuv420
 
 https://github.com/user-attachments/assets/c3a629ee-509a-4543-88f7-aaa2811e204b
 
+
+## geom_descr
+
+```
+struct geom_descr {
+ uint32_t in_vertex_base;
+ uint32_t in_faces_base;
+ uint32_t in_matrix_base;
+ uint16_t in_nbr_faces;
+ uint32_t next_desc; // null means end-of-list
+};
+```

@@ -28,11 +28,9 @@ module geom_tb_top #(
     wire [15:0] dq_ctrl_out, dq_model_out; wire dq_ctrl_oe, dq_model_oe;
 
     geom_front #(
-        .MEM_AW(MEM_AW), .MATRIX_BASE(MATRIX_BASE), .LIGHT_BASE(LIGHT_BASE),
-        .VTX_BASE(VTX_BASE), .FACE_BASE(FACE_BASE), .TRI_BASE(TRI_BASE),
-        .BIN_BASE(BIN_BASE), .BINLIST_BASE(BINLIST_BASE)
+        .MEM_AW(MEM_AW)
     ) geom (
-        .clk(clk), .rst(rst), .start(start), .nfaces(nfaces), .mat_index(16'd0), .done(done),
+        .clk(clk), .rst(rst), .start(start), .desc_head(MEM_AW'(MATRIX_BASE)), .done(done),
         .mem_addr(gaddr), .mem_req(greq), .mem_we(gwe), .mem_wr_data(gwdata),
         .mem_wr_data_req(gwdreq), .mem_rd_data(grdata), .mem_rd_valid(grdvalid),
         .mem_ready(gready)

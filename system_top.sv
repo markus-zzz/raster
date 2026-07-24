@@ -159,15 +159,10 @@ module system_top #(
         .NTX((FRAME_W + TILE_W - 1) / TILE_W),
         .NTY((FRAME_H + TILE_H - 1) / TILE_H),
         .TILE_W(TILE_W), .TILE_H(TILE_H),
-        .MAX_FACES_PER_TILE(1024),
-        .MATRIX_STRIDE(24),
-        .MATRIX_BASE(24'h02_0000), .LIGHT_BASE(24'h02_0880),
-        .VTX_BASE(24'h02_1000),    .FACE_BASE(24'h02_2000),
-        .TRI_BASE(24'h00_0000),    .BIN_BASE(24'h00_4000),
-        .BINLIST_BASE(24'h00_5000)
+        .MAX_FACES_PER_TILE(1024)
     ) geom (
-        .clk(clk), .rst(rst), .start(geom_start), .nfaces(nfaces),
-        .mat_index(16'd0), .done(geom_done),   // single CPU-computed matrix at MATRIX_BASE
+        .clk(clk), .rst(rst), .start(geom_start),
+        .desc_head(24'h02_0040), .done(geom_done),   // CPU builds the descriptor list here
         .mem_addr(geom_addr), .mem_req(geom_req), .mem_we(geom_we),
         .mem_wr_data(geom_wr_data), .mem_wr_data_req(geom_wr_data_req),
         .mem_rd_data(geom_rd_data), .mem_rd_valid(geom_rd_valid), .mem_ready(geom_ready)
