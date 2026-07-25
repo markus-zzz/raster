@@ -397,17 +397,33 @@ int main(int argc, char **argv) {
     // at boot. The per-frame matrices are NO LONGER baked here -- the CPU
     // computes them at runtime -- so the matrix region is left zeroed.
     {
-        std::vector<uint16_t> rom(INPUT_WORDS, 0);
-        auto w16 = [&](int a, uint16_t v){ rom[a - INPUT_BASE] = v; };
-        auto w32 = [&](int a, uint32_t v){ w16(a, v & 0xFFFF); w16(a+1, (v>>16) & 0xFFFF); };
-        w32(LIGHT_BASE + 0, (uint32_t)NEG_LIGHT_DIR.x);
-        w32(LIGHT_BASE + 2, (uint32_t)NEG_LIGHT_DIR.y);
-        w32(LIGHT_BASE + 4, (uint32_t)NEG_LIGHT_DIR.z);
-        for (size_t i = 0; i < vertices.size(); i++) {
-            w32(VTX_BASE + i*8 + 0, (uint32_t)vertices[i].x);
-            w32(VTX_BASE + i*8 + 2, (uint32_t)vertices[i].y);
-            w32(VTX_BASE + i*8 + 4, (uint32_t)vertices[i].z);
+
+    FILE *fp = fopen("suzanne.h", "w");
+    fprintf(fp, "#include \"gputypes.h\"\n");
+    fprintf(fp, "const GpuVertex_t suz_vtx[] = {\n");
+
+
+        for (auto &v : vertices) {
+            fprintf(fp, "  {0x%x,0x%x,0x%x},\n", v.x, v.y, v.z);
         }
+    fprintf(fp, "};\n\n");
+
+    fprintf(fp, "const GpuFace_t suz_face[] = {\n");
+    for (auto &f : faces) {
+      fprintf(fp, " {%d,%d,%d, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x},\n", f.v[0],f.v[1],f.v[2],
+            f.normal.x,
+            f.normal.y,
+            f.normal.z,
+            f.color.x,
+            f.color.y,
+            f.color.z);
+    }
+    fprintf(fp, "};\n");
+    fclose(fp);
+    }
+#if 0
+    {
+
         for (size_t f = 0; f < faces.size(); f++) {
             int b = FACE_BASE + f*16;
             w16(b+0, faces[f].v[0]);
@@ -422,7 +438,7 @@ int main(int argc, char **argv) {
         }
         dump_inputs_hex("sdram_inputs.hex", rom, (int)faces.size());
     }
-
+#endif
     // In --emit-inputs mode we only (re)generate the header the firmware needs;
     // the CPU ROM (bios.vh) is then built from it before the real sim run.
     if (emit_inputs_only) { printf("Wrote sdram_inputs.hex\n"); return 0; }
