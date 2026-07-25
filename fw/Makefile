@@ -6,7 +6,7 @@ sintab.h: gen_sintab.py
 	python3 gen_sintab.py
 
 # main.c pulls in the generated sine table and the host-generated input image.
-main.o: main.c sintab.h sdram_inputs.hex
+main.o: main.c sintab.h
 
 %.o: %.c
 	clang --target=riscv32 -march=rv32imc -std=c99 -O3 -Os -fno-inline -mno-relax -Wall -Werror -c $< -o $@

@@ -20,7 +20,6 @@
 
 module display_ctrl #(
     parameter MEM_AW     = 24,
-    parameter FB_BASE    = 24'h00_A000,
     parameter FB_LEN     = 64000,   // 320 * 200
     parameter BURST      = 8,
     parameter FIFO_DEPTH = 32
@@ -46,7 +45,9 @@ module display_ctrl #(
 
     // Pixel output (one valid pulse per popped pixel)
     output logic [15:0]       pix_data,
-    output logic              pix_valid
+    output logic              pix_valid,
+
+    input wire [MEM_AW-1:0]   fb_base
 );
 
     localparam FIFO_AW = $clog2(FIFO_DEPTH);
@@ -74,7 +75,7 @@ module display_ctrl #(
     logic req_pending;  // we want to start a burst
     assign mem_we      = 1'b0;
     assign mem_wr_data = 16'h0;
-    assign mem_addr    = FB_BASE[MEM_AW-1:0] + MEM_AW'(fb_ptr);
+    assign mem_addr    = fb_base + MEM_AW'(fb_ptr);
     assign mem_req     = req_pending;
 
     wire have_room = (count + outstanding + (FIFO_AW+1)'(BURST)) <= FIFO_DEPTH;
@@ -90,7 +91,7 @@ module display_ctrl #(
 
     // ---- FIFO + pointer + counter update ----
     always_ff @(posedge clk) begin
-        if (rst || frame_start) begin
+        if (rst | frame_start) begin
             wr_ptr <= 0;
             rd_ptr <= 0;
             count  <= 0;

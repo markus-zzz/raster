@@ -40,7 +40,7 @@ static void sdram_write(uint32_t sdram_dst, const void *ram_src,
 
 // Keep in mind that SDRAM is word addressed
 uint32_t sdram_alloc(uint32_t size) {
-  static uint32_t sdram_alloc_next = 0x20100;
+  static uint32_t sdram_alloc_next = 0x100;
   uint32_t tmp = sdram_alloc_next;
   sdram_alloc_next += ((size + 7) & ~7); // Everything is multiple of 8 words
   return tmp;

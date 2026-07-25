@@ -17,7 +17,7 @@ module sdram_model #(
     // sets the address-wrap width (must cover the highest address used);
     // MEM_DEPTH sets how much storage is actually allocated. Every address
     // used must be < MEM_DEPTH. Default: 384 KB = 192 K halfwords.
-    parameter MEM_DEPTH = 512 * 1024,
+    parameter MEM_DEPTH = 16 * 1024 * 1024,
     parameter INIT_FILE = ""     // optional $readmemh preload of the storage
 ) (
     input  wire                   sdram_clk,

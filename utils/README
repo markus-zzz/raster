@@ -1,0 +1,1 @@
+blender --background ~/Documents/suzanne.blend --python export_gpumesh.py

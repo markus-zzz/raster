@@ -158,12 +158,13 @@ module geom_front #(
     endfunction
 
     integer k;
+    assign done = (st == S_DONE);
     always_ff @(posedge clk) begin
         if (rst) begin
-            st <= S_IDLE; done <= 0; g_start <= 0; burst_go <= 0; burst_we <= 0;
+            st <= S_IDLE; g_start <= 0; burst_go <= 0; burst_we <= 0;
             region_active <= 0;
         end else begin
-            g_start <= 0; burst_go <= 0; done <= 0;
+            g_start <= 0; burst_go <= 0;
             case (st)
                 S_IDLE: if (start) begin
                     desc_ptr <= desc_head; region_active <= 0; st <= S_DESC0;
@@ -371,7 +372,7 @@ module geom_front #(
                     end
                 end
 
-                S_DONE: begin done <= 1; st <= S_IDLE; end
+                S_DONE: begin st <= S_IDLE; end
                 default: st <= S_IDLE;
             endcase
         end
