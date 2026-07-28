@@ -7,6 +7,10 @@
 
 #include "suzanne.h"
 
+#define IRQ_MASK_VSYNC (1UL << 0)
+#define IRQ_MASK_GEOM_DONE (1UL << 1)
+#define IRQ_MASK_RAST_DONE (1UL << 2)
+
 void irq_mask(uint32_t mask);
 
 volatile uint32_t *const R_GEOM_DESC_HEAD = (volatile uint32_t *)0x20000010;
@@ -179,7 +183,7 @@ int main(void) {
   // SET_OUTPUT -> OBJECT(suz) -> OBJECT(cube) -> end
   build_descriptors();
 
-  irq_mask(0);
+  irq_mask(~(IRQ_MASK_VSYNC | IRQ_MASK_GEOM_DONE | IRQ_MASK_RAST_DONE));
 
   for (;;) {
   }
@@ -204,30 +208,50 @@ uint32_t *irq(uint32_t *regs, uint32_t irqs) {
 
   static uint32_t ax = 0, ay = 0, bob = 0, phi = 0, rx = 0, ry = 0;
   static unsigned fb_idx = 0;
-  *R_RAST_FB_BASE = fb_base[fb_idx & 1];
-  fb_idx++;
-  *R_DISP_FB_BASE = fb_base[fb_idx & 1];
 
-  fx ty = fmul(BOB_AMP, fx_sin(bob)); // slow vertical bob
-  write_suz_matrix(ax, ay, ty);       // Suzanne head at suz_mat_base
-  write_cube_matrix(rx, ry, phi, ty); // orbiting cube tumbling about X and Y
+  static enum {
+    S_WAIT_VSYNC,
+    S_WAIT_GEOM_DONE,
+    S_WAIT_RAST_DONE
+  } state = S_WAIT_VSYNC;
 
-  // Start geometry pass and wait for it to finish
-  *R_GEOM_CTRL_STAT = 1;
-  while (*R_GEOM_CTRL_STAT & 1)
-    ;
+  switch (state) {
+  case S_WAIT_VSYNC:
+    if (irqs & IRQ_MASK_VSYNC) {
+      // Switch display buffers (double buffering)
+      *R_RAST_FB_BASE = fb_base[(fb_idx + 0) & 1];
+      *R_DISP_FB_BASE = fb_base[(fb_idx + 1) & 1];
+      fb_idx++;
 
-  // Start rasterization pass and wait for it to finish
-  *R_RAST_CTRL_STAT = 1;
-  while (*R_RAST_CTRL_STAT & 1)
-    ;
+      *R_GEOM_CTRL_STAT = 1; // Start geometry pass
+      state = S_WAIT_GEOM_DONE;
+    }
+    break;
+  case S_WAIT_GEOM_DONE:
+    if (irqs & IRQ_MASK_GEOM_DONE) {
+      *R_RAST_CTRL_STAT = 1; // Start rasterization pass
 
-  ay += AY_INC;
-  ax += AX_INC;
-  bob += BOB_INC;
-  phi += PHI_INC;
-  rx += RX_INC;
-  ry += RY_INC;
+      // Then update matrices for next geometry pass
+      fx ty = fmul(BOB_AMP, fx_sin(bob));
+      write_suz_matrix(ax, ay, ty);
+      write_cube_matrix(rx, ry, phi, ty);
+
+      ay += AY_INC;
+      ax += AX_INC;
+      bob += BOB_INC;
+      phi += PHI_INC;
+      rx += RX_INC;
+      ry += RY_INC;
+
+      state = S_WAIT_RAST_DONE;
+    }
+    break;
+  case S_WAIT_RAST_DONE:
+    if (irqs & IRQ_MASK_RAST_DONE) {
+      state = S_WAIT_VSYNC;
+    }
+    break;
+  }
 
   return regs;
 }

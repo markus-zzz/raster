@@ -282,7 +282,7 @@ module gpu_top #(
       .pcpi_wait (cpu_pcpi_wait),
       .pcpi_ready(cpu_pcpi_ready),
       // Interrupts
-      .irq(display_frame_start),
+      .irq({rast_done, geom_done, display_frame_start}),
       // PicoRV32 Native Memory Interface
       .mem_valid(cpu_mem_valid),
       .mem_instr(cpu_mem_instr),
