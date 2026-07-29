@@ -2,8 +2,8 @@ OBJS = main.o start.o
 
 all: bios.vh
 
-sintab.h: gen_sintab.py
-	python3 gen_sintab.py
+sintab.h: ../utils/gen_sintab.py
+	python3 $<
 
 # main.c pulls in the generated sine table and the host-generated input image.
 main.o: main.c sintab.h
